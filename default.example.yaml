@@ -1,0 +1,17 @@
+dataset:
+  path: /path/to/dataset
+  source_lang: Java
+  target_lang: Python
+codegraph:
+  base_url: http://127.0.0.1:3000
+  timeout_seconds: 120
+mapping:
+  model_path: /path/to/jina-code-embeddings-1.5b
+  # Jina 权重下载使用，ID 和版本应配套更新
+  model_id: jinaai/jina-code-embeddings-1.5b
+  model_revision: 39aeb4fb9b60f930934c78ae5d749a46287c248a
+  # Jina 官方 code2code 前缀，保留末尾换行
+  query_prompt: "Find an equivalent code snippet given the following code snippet:\n"
+  document_prompt: "Candidate code snippet:\n"
+  # 单个编码块的 Token 上限，包含前缀
+  max_length: 4096

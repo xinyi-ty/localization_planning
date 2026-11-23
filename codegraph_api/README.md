@@ -1,0 +1,336 @@
+# CodeGraph JavaScript Repository API
+
+基于官方 `@colbymchenry/codegraph@1.6.2` SDK，实现建库、同步、调用查询、源码读取、函数清单、定义归属和依赖查询。运行代码为普通 ESM JavaScript。[`src/codegraph-repository.js`](./src/codegraph-repository.js) 实现业务接口；[`src/contracts.d.ts`](./src/contracts.d.ts) 提供对应的编辑器类型声明，不需要编译 TypeScript。
+
+## 安装和使用
+
+运行环境要求 **Node.js 24.x**，当前已在 Node.js 24.15.0 上验证。SDK 的数据库实现依赖内置 `node:sqlite`，请先确认 Node 版本再安装。
+
+```bash
+node --version # 应为 v24.x.x
+cd codegraph_api
+npm ci
+```
+
+## 启动 HTTP 服务
+
+```bash
+npm start
+```
+
+默认地址为 `http://127.0.0.1:3000`，保持服务进程运行，再从 Python 发起请求。启动时不绑定仓库，每次请求通过 `projectRoot` 指定 **JS 服务所在机器上的仓库绝对路径**，不会上传 Python 所在机器上的文件。需要修改监听设置时，可通过环境变量 `HOST`、`PORT` 配置，例如在 Bash 中执行 `PORT=3001 npm start`。
+
+### 自动生成的接口文档
+
+启动后访问：
+
+- [交互式接口文档](http://127.0.0.1:3000/doc)：查看接口的中文说明、参数示例、成功和错误响应结构，并在页面中填写 JSON 发起请求。
+- [OpenAPI JSON](http://127.0.0.1:3000/doc/json)：获取接口规范，可导入支持 OpenAPI 的客户端工具。
+
+文档通过 `@elysia/openapi` 从路由和请求参数 Schema 自动生成，默认使用 Scalar 页面。页面前端资源默认通过 CDN 加载，浏览器需要能够访问该 CDN。修改 `HOST`、`PORT` 后使用对应服务地址访问文档。
+
+请求示例中的仓库路径、符号名称和行号需要替换为实际值。可先调用 `/getAllFunctions`，直接使用返回的 key 发起后续查询。页面中的初始化和同步会实际修改目标仓库索引。
+
+所有业务接口使用 **POST + JSON**，请求头为 `Content-Type: application/json`，路径与 JS 函数同名：
+
+| 路径 | JSON 请求体 |
+| --- | --- |
+| `/initialize` | `{ "projectRoot": "/path/to/repo", "options": { "language": "python" } }` |
+| `/sync` | `{ "projectRoot": "/path/to/repo" }` |
+| `/getAllFunctions` | `{ "projectRoot": "/path/to/repo" }` |
+| `/getCallees` | `{ "projectRoot": "/path/to/repo", "key": { "name": "run", "filePath": "src/worker.py", "startLine": 8 } }` |
+| `/getContent` | `{ "projectRoot": "/path/to/repo", "input": { "name": "run", "filePath": "src/worker.py", "startLine": 8 } }` |
+| `/getLocation` | `{ "projectRoot": "/path/to/repo", "key": { "name": "run", "filePath": "src/worker.py", "startLine": 8 } }` |
+| `/getDependencies` | `{ "projectRoot": "/path/to/repo", "level": "class", "input": { "name": "Worker", "filePath": "src/worker.py", "startLine": 1 } }` |
+
+`/initialize` 的 `options` 可省略；`language` 支持字符串、非空字符串数组或 null，含义与 JS 接口一致。读取整个文件时，`/getContent` 的 `input` 改为 `{ "kind": "file", "filePath": "src/worker.py" }`。`filePath` 相对于 `projectRoot`，`startLine` 从 1 开始。
+
+Python 示例（先安装 `requests`：`python -m pip install requests`）：
+
+```python
+import requests
+
+base_url = "http://127.0.0.1:3000"
+project_root = "/absolute/path/to/repository"
+
+def call(method, **parameters):
+    response = requests.post(
+        f"{base_url}/{method}",
+        json={"projectRoot": project_root, **parameters},
+        timeout=300,
+    )
+    response.raise_for_status()
+    return response.json()
+
+# 仅尚未建库的仓库执行一次；已有仓库直接查询。
+# call("initialize", options={"language": "python"})
+
+key = {"name": "run", "filePath": "src/worker.py", "startLine": 8}
+location = call("getLocation", key=key)
+content = call("getContent", input=key)
+functions = call("getAllFunctions")
+print(location)
+
+# 统一更新源码后执行，更新完成再查询，并按新位置填写 key。
+# call("sync")
+```
+
+成功响应为 HTTP `200`，JSON 直接是现有业务方法的返回值；`/getAllFunctions` 返回数组。失败响应统一为：
+
+```json
+{
+  "error": {
+    "code": "NODE_NOT_FOUND",
+    "message": "No node matches the supplied key."
+  }
+}
+```
+
+| HTTP 状态码 | 错误情况 |
+| --- | --- |
+| `400` | JSON 格式错误、缺少参数、无效 key、语言不支持、路径非绝对路径或节点类型不适用 |
+| `404` | 路由、仓库目录、文件或节点不存在，或源码不可用 |
+| `409` | `NOT_INITIALIZED`、`ALREADY_INITIALIZED` 或 `AMBIGUOUS_NODE` |
+| `500` | 其他 SDK、数据库或文件系统错误 |
+
+歧义错误包含 `error.candidates`；索引失败如果带原始结果，会附在 `error.result`。Python 需要查看错误详情时，在 `raise_for_status()` 前读取 `response.json()`。超时会结束客户端等待，不会自动取消服务器正在执行的建库或同步。
+
+服务按真实仓库路径复用实例和内存索引，各仓库独立保存。所有接口都能获取或创建实例，因此服务重启后，已建库仓库可直接查询，无须重新初始化。符号链接别名通过 `realpath()` 统一。缓存与调用关系的处理仍由现有业务模块负责。
+
+不设置操作队列，由使用方统一安排更新，避免初始化或同步期间查询同一仓库。服务默认仅供本机调用，没有增加认证机制。
+
+### 查询 class / file 依赖
+
+`/getDependencies` 支持 `level: "class"` 和 `level: "file"`。class 输入使用 `{ name, filePath, startLine }`，file 输入使用 `{ kind: "file", filePath }`：
+
+```python
+class_dependencies = call(
+    "getDependencies",
+    level="class",
+    input={"name": "Worker", "filePath": "src/worker.py", "startLine": 1},
+)
+file_dependencies = call(
+    "getDependencies",
+    level="file",
+    input={"kind": "file", "filePath": "src/worker.py"},
+)
+```
+
+返回 `{ entry, dependencies }`，dependencies 只列唯一目标，不返回关系种类或数量。class 层聚合 `calls`、`extends`、`implements`、`instantiates`，将成员间关系提升到最近所属的 class、struct 或 interface，并排除自身依赖。file 层按文件路径聚合上述符号关系，并包含 `imports`，排除同文件关系。class 目标是三元 key；file 目标是 `{ kind: "file", filePath }`。结果只表示 SDK 索引中可解析的直接关系，不推导传递依赖。
+
+## 直接使用 JavaScript
+
+基础查询的能力范围见 [查询能力边界说明](./ANALYSIS_BOUNDARIES.md)。测试框架识别、对象数据流分析和跨文件完整源码组装由调用方负责。
+
+`src/index.js` 导出 `CodeGraphRepository` 和 `createRepository()`。应用代码调用工厂创建实现：
+
+```javascript
+import { createRepository } from './codegraph_api/src/index.js';
+
+async function main() {
+    const repository = createRepository('/absolute/path/to/repository');
+
+    // 1. 初始化。目标目录应当已经存在，且尚未建立 CodeGraph 数据库。
+    await repository.initialize({ language: 'python' });
+
+    // 2. 以后修改源码后，调用 SDK 的 sync 更新数据库。
+    await repository.sync();
+
+    // 3. 获取所有 function/method 节点（可选，不是查询的前置步骤）。
+    const functions = await repository.getAllFunctions();
+
+    // 4. 名称、相对路径和行号按实际源码填写；行号从 1 开始。
+    const calls = await repository.getCallees({
+        name: 'entry', filePath: 'service.py', startLine: 4
+    });
+
+    // 5. 传入 key 读取源码；读整个文件用 { kind: 'file', filePath }。
+    const content = await repository.getContent({
+        name: 'add', filePath: 'service.py', startLine: 1
+    });
+
+    return { calls: calls, content: content, functions: functions };
+}
+
+main().catch(console.error);
+```
+
+所有接口均返回 Promise，通过 `await` 取结果。查询期间自动打开只读连接，操作结束自动关闭；调用方不需要维护 SDK 连接。
+
+## 1. 初始化仓库
+
+```javascript
+await repository.initialize();                              // 不限制语言
+await repository.initialize({ language: null });            // 不限制语言
+await repository.initialize({ language: 'python' });        // 只选 Python
+await repository.initialize({ language: 'cpp' });           // 只选 C++
+await repository.initialize({ language: 'java' });          // 只选 Java
+await repository.initialize({ language: ['python', 'java'] });
+```
+
+以上是不同新仓库的调用示例，不能对同一已初始化仓库连续执行初始化。已有数据库会报错，后续应调用 `sync()`。
+
+- 语言名称使用 SDK 的语言 ID，例如 `python`、`cpp`、`java`；不接受 `py`、`c++` 等别名。
+- 默认不限制语言时，调用 `CodeGraph.init(root, {index: false})`，再执行 `cg.indexAll()`。
+- 限定语言时，用 SDK 的 `detectLanguage()` 筛选文件，传入原生 `cg.sync({paths: ...})`，由 SDK 完成提取和引用解析。
+- SDK 没有原生的 `language` 建库选项；该参数是此模块实现的策略。
+- 策略保存在目标仓库的 `.codegraph/repository-api.json`，不会修改根目录 `codegraph.json`。
+- `.gitignore` 和项目配置中的 `exclude` 仍由 SDK 执行；没有承诺把磁盘上的所有文件强制入库。
+
+语言判断遵循 SDK。例如 `.h` 默认判定为 `c`，纯 `cpp` 策略不包含它。需要 C/C++ 混合源码时，可传 `['cpp', 'c']`；也可在仓库原有的 `codegraph.json` 中配置 `.h` 的语言映射。
+
+初始化返回 SDK 的 `IndexResult`（不限制语言）或 `SyncResult`（限定语言）。不限制语言的建库如果返回失败或存在文件级错误，会抛出异常，原始结果保存在 `error.result`。索引失败可能留下部分数据库，修正问题后可调用 `sync()` 重试。
+
+## 2. 更新仓库
+
+```javascript
+const repository = createRepository('/absolute/path/to/repository');
+const result = await repository.sync();
+```
+
+内部执行官方 SDK 的 `cg.sync()`，包括文件新增、修改、删除和引用关系更新，不使用子进程拼接 CLI 命令。该 SDK 方法承担 `codegraph sync` 对应的更新职责。
+
+限定语言的仓库会重新发现该语言的文件，并把数据库已有文件路径加入检查清单，因此能发现新文件和被删除的旧文件；跨进程重新创建 `repository` 对象后也会读取保存的策略。
+
+返回原生 `SyncResult`，可检查 `filesAdded`、`filesModified`、`filesRemoved`、`failedFilePaths` 等字段。查询不会自动执行同步，代码修改后应先调用此接口。
+
+语言策略由本模块维护。直接在仓库执行全量 CLI `sync` / `index`，或者使用其他 SDK 实例执行全量同步，不会读取本模块的策略，可能将其他语言加入数据库；随后本接口会报告语言范围不一致，要求重建。不要把两种更新入口混用。
+
+## 3. 获取直接调用的函数
+
+```javascript
+const result = await repository.getCallees({
+    name: 'entry', filePath: 'service.py', startLine: 4
+});
+```
+
+返回结构：
+
+```javascript
+{
+    entry: /* 入口的 { name, filePath, startLine } */,
+    functions: [/* 直接调用的 function/method key */],
+    edges: [/* 入口的原生 calls Edge 对象 */]
+}
+```
+
+例如 `entry -> helper -> total -> add`：`functions` 为 `[helper]`，不包含间接调用的 `total`、`add`。
+
+实现从预先构建的依赖图读取入口节点的 `calls` 邻接关系，返回直接调用目标；图构建时从 SDK 批量读取原始边。保留实际调用边用于还原调用位置，函数结果按节点 ID 去重，并排除入口自己；自递归调用边保留在 `edges` 中。方法之间、函数与方法之间的 `calls` 边使用同一流程。
+
+这是**已构建图中的直接调用结果**。CodeGraph 构图漏掉的动态调用、宏调用等不会被补出；未解析到项目节点的外部库函数也无法返回源码节点。
+
+## 4. 读取函数、类或整个文件
+
+```javascript
+const functionContent = await repository.getContent({
+    name: 'add', filePath: 'service.py', startLine: 1
+});
+const classContent = await repository.getContent({
+    name: 'Worker', filePath: 'service.py', startLine: 7
+});
+const methodContent = await repository.getContent({
+    name: 'run', filePath: 'service.py', startLine: 8
+});
+
+const fileContent = await repository.getContent({ kind: 'file', filePath: 'service.py' });
+```
+
+符号查询传入 `{ name, filePath, startLine }`，行号按实际索引位置填写；不需要先获得节点或 ID。整个文件查询传 `{ kind: 'file', filePath }`。`getAllFunctions()` 返回的 key 可以直接传入。
+
+返回结构：
+
+```javascript
+{
+    node: /* 原生 Node；整个文件未对应 file 节点时可以为 null */,
+    filePath: 'core.py',
+    source: 'def add(a, b):\n    return a + b'
+}
+```
+
+函数和方法仍使用 `await cg.getCode(id)` 读取指定节点源码；整个文件通过文件系统读取完整 UTF-8 内容。C++ / C# 类型查询增加以下合并行为：
+
+- C++：每次查询遍历索引中的类型和方法，按完整限定名及包含关系收集类外实现，包括重载、构造/析构和嵌套类的类外方法。多个同名类型通过 SDK 已解析的 include/import 文件可见性区分；无法消歧时返回 `AMBIGUOUS_NODE`。
+- C#：每次查询遍历同种类型节点，将完整限定名、泛型参数数量及外层类型匹配的 `partial` 部分合并。存在 `.csproj` 时按最近的项目文件隔离；没有项目文件时以整个索引仓库为匹配范围。多个项目文件无法区分时返回歧义，不执行 MSBuild 或评估链接源码配置。
+- `source` 返回去重后的源码片段，以空行连接；C++ 先返回类声明，再按文件路径、行列排序附加实现，C# 各部分按文件路径、行列排序。已包含在类型片段中的成员不重复追加。合并片段按 SDK 的行列位置裁剪，避免引入同一行的其他声明。
+
+返回结构仍为 `{ node, filePath, source }`：`node` 和 `filePath` 始终是输入命中的节点和文件，`source` 可以来自多个文件。合并不添加 namespace、using、include 或其他依赖，不保证结果可直接编译。只收集 SDK 已索引的声明和方法；SDK 未生成节点的静态字段类外定义等内容无法补齐。类关联结果不做跨调用缓存，源码修改后仍需 `sync()`。
+
+其他语言类型保留单节点读取。返回的 `source` 是本接口组织的字段，不是往原生 Node 上添加的属性。文件路径相对于仓库根目录，不能越出仓库。
+
+## 5. 获取项目中全部函数
+
+```javascript
+const functions = await repository.getAllFunctions();
+```
+
+返回 `NodeKey[]`，合并 `cg.getNodesByKind('function')` 和 `cg.getNodesByKind('method')`，按内部节点的文件、起始行和 ID 排序后，每项仅返回 `{ name, filePath, startLine }`。
+
+这里的“全部”指数据库中的函数和方法节点，包含已入库测试函数；不包含作为其他节点类型表示的实体，也不绕过初始化时选择的语言范围。
+
+## 6. 查询函数或方法的定义归属
+
+```javascript
+const location = await repository.getLocation({
+    name: 'run', filePath: 'src/worker.py', startLine: 8
+});
+// location = { key, filePath, container }
+```
+
+`key` 是匹配的函数或方法的三元 key，`filePath` 是它在仓库中的相对路径。`container` 是 SDK 包含关系中最近的 class、struct 或 interface 的三元 key，未找到时为 `null`。文件级普通函数通常返回 `null`；嵌套类的方法返回最近的所属类，方法内的嵌套函数沿祖先关系查找最近的所属类型。查询表示源码定义归属，不包含继承或调用关系。
+
+先复用现有内存索引的 `findNode(key)`，再通过 `cg.getAncestors(node.id)` 查询归属，不新增缓存格式或名称索引。SDK 缺少包含关系时也可能返回 `null`，不能据此断言源码中没有所属类型。key 无效或匹配到非函数/方法时抛 `INVALID_SELECTOR`；没有匹配抛 `NODE_NOT_FOUND`；多个匹配抛 `AMBIGUOUS_NODE` 并提供 `error.candidates`。
+
+## 节点 key、缓存与错误
+
+`getCallees` 和符号形式的 `getContent` 接收 `NodeKey`：
+
+```javascript
+{ name: 'entry', filePath: 'src/service.py', startLine: 4 }
+```
+
+名称精确匹配；路径相对于目标仓库根目录，统一分隔符、归一化 `./`；起始行是从 1 开始的整数。不能使用绝对路径或越出仓库。三个字段都必须提供。
+
+内部 `findNode(key)` 查询内存 Map：没有匹配时抛 `NODE_NOT_FOUND`；一个匹配时继续查询；多个匹配时抛 `AMBIGUOUS_NODE`，`error.candidates` 保存候选原生节点，不自动选择第一个。`findNode` 不作为用户接口导出。
+
+`initialize()` 索引完成和 `sync()` 更新完成后，内部 `loadSymbolNodes(cg)` 加载 function、method、class、struct、interface 五类完整节点。`refreshNodeCache(cg)` 将 `{ version: 1, nodes: [...] }` 写入**目标仓库**的 `.codegraph/nodes-cache.json.tmp`，写完后重命名为 `.codegraph/nodes-cache.json` 替换旧文件，再建立内存索引。`getAllFunctions()` 仍只查询函数和方法，不承担缓存加载职责。
+
+新实例首次按 key 查询时读取 JSON 并建立内存索引；缓存缺失、JSON 损坏、结构无效或版本不兼容时，从已有数据库重建，无须重新初始化。后续 key 到节点 ID 的匹配不查询数据库；调用边从依赖图读取，源码仍由 SDK 读取。读取整个文件不依赖符号缓存。
+
+更新开始清空当前实例内存；更新或缓存生成抛出异常时删除持久缓存并传播错误，后续查询从数据库重建。成功写入使用临时文件替换，不先删除正式文件。`sync()` 仍返回原生结果；如包含失败文件，缓存反映数据库已有节点，不代表每个源码文件都同步成功。
+
+通过本模块修改索引后使用当前实例查询；其他已加载缓存的实例不会自动感知更新，应重新创建。不要并发更新和查询同一仓库，也不要混用外部 CLI/SDK 修改索引；本实现不检测外部更新或进程突然退出期间留下的旧缓存。
+
+`getCallees` 只接受函数或方法；`getContent` 支持上述五类符号或文件选择器。无效输入或节点类型不适用抛 `INVALID_SELECTOR`；源码不可用抛 `SOURCE_NOT_FOUND`。SDK 和文件系统错误直接传播。
+
+## 依赖图构建与缓存
+
+`initialize()` 和 `sync()` 完成 SDK 索引及符号缓存刷新后，全量构建依赖图。通过公开 SDK 获取所有节点类型和 `contains`、`calls`、`extends`、`implements`、`instantiates`、`imports` 边，提前生成函数调用、类依赖和文件依赖的邻接关系。
+
+依赖图独立保存到目标仓库 `.codegraph/dependencies-cache.json`，不修改 SDK 内部数据库。内容包括版本、节点 ID/key 元数据、原始边，以及类/文件聚合关系；聚合关系的 `edgeIndices` 指回原始边，保留依赖依据。先写 `.tmp`，再重命名替换正式文件，最后安装新内存图。图构建或索引更新抛错时使符号缓存和依赖图均失效，后续查询从数据库重建。
+
+`getCallees` 和 `getDependencies` 的参数及返回结构不变；每次仍打开只读 SDK 连接校验仓库状态，符号 key 由现有节点缓存定位，实际关系及目标从内存图获取，不再逐次查询 SDK 调用边或聚合依赖。新实例从持久图加载；缓存缺失、损坏、结构无效或版本不兼容时从 SDK 重建，并复用并发首次加载。读取失败等真实文件系统错误会传播。
+
+类依赖只按 SDK `contains` 关系映射到最近的 class、struct 或 interface，不额外关联 C++ 类外实现或合并 C# partial。缺少类型归属的端点不计入类聚合；file 依赖按实际文件路径计算。图不加入 `references`、`type_of` 等其他关系，也不计算传递闭包。函数及类目标按文件、行号、ID 排序，文件目标按路径排序；调用边保留原始内容。
+
+更新与查询仍由调用方串行安排。其他实例已加载的依赖图不会自动感知同步，应重新创建实例；直接使用外部 CLI/SDK 更新、进程中断遗留缓存的限制与符号缓存一致。`getContent`、`getLocation` 不使用这份依赖图，保留既有行为。
+
+## 代码职责
+
+| 文件                            | 职责                                                  |
+| ------------------------------- | ----------------------------------------------------- |
+| `src/contracts.d.ts`          | 编辑器类型声明                                        |
+| `src/index.js`                | 导出实现类和工厂函数                                  |
+| `src/server.js`               | Node HTTP 服务启动、监听配置和退出处理                |
+| `src/http-api.js`             | Elysia 路由、JSON 参数校验和 HTTP 错误响应              |
+| `src/openapi.js`              | 接口文档元数据、SDK 返回结构和错误响应说明             |
+| `src/repository-manager.js`   | 仓库路径规范化与实例复用                              |
+| `src/codegraph-repository.js` | 业务方法的实现，SDK 生命周期、同步流程与策略保存  |
+| `src/language-scope.js`       | 语言参数校验、文件语言筛选                            |
+| `src/node-cache.js`           | 内部五类符号加载、持久缓存、内存索引与 key 匹配       |
+| `src/graph-queries.js`        | 依赖图查询适配、内容与定义归属查询 |
+| `src/dependency-graph.js`     | SDK 基础关系读取、类/文件依赖聚合与图查询 |
+| `src/dependency-cache.js`     | 依赖图持久化、加载、重建与内存复用 |
+| `src/class-content.js`        | C++ 类外实现与 C# partial 源码的全局查找和合并 |
+
+业务方法都在 `CodeGraphRepository` 中。调用方通过 `createRepository()` 工厂获得实例。缓存模块仅供内部使用；没有读取或改写 CodeGraph 的内部 SQL 表。

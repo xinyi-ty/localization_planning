@@ -1,0 +1,27 @@
+{
+  "name": "codegraph_api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Repository indexing and source queries through the official CodeGraph SDK",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/contracts.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/contracts.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "dependencies": {
+    "@colbymchenry/codegraph": "1.6.2",
+    "@elysia/node": "1.4.6",
+    "@elysia/openapi": "1.4.16",
+    "elysia": "1.4.30"
+  }
+}
