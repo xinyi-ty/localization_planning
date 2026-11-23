@@ -94,7 +94,7 @@ def test_context(analysis, case, graph):
     return '\n\n'.join(sections)
 
 
-def rank_candidates(query_vectors, documents, functions, top_k=5):
+def rank_candidates(query_vectors, documents, functions, top_k):
     """同一代码记录的多个向量按最高余弦相似度归并。"""
     similarities = (query_vectors @ documents['vectors'].T).amax(dim=0)
     scores = {}
@@ -292,10 +292,6 @@ def map_tests(service, project, batches):
     def business_functions(key):
         return source_business_calls(records[key], service.graph, root, service.source, records, test_files, source_file)
 
-    @cache
-    def business_documents(keys):
-        return encoder.encode([records[key]['source'] for key in keys], query=False)
-
     def map_case(ref):
         index = query_indices[reference_identity(ref)]
         vectors = encoded_queries['vectors'][[i for i, owner in enumerate(encoded_queries['owners']) if owner == index]]
@@ -312,13 +308,12 @@ def map_tests(service, project, batches):
         if any(keys != entry_sets[0] for keys in entry_sets[1:]):
             matches = verify_source_tests(ref, queries[index], shortlist, functions, records,
                                           service.source, service.target)
-        merged = {symbol_identity(r['key']): r
-                  for test in matches for r in business_functions(symbol_identity(test))}
-        if not merged:
+        keys = {symbol_identity(r['key'])
+                for test in matches for r in business_functions(symbol_identity(test))}
+        if not keys:
             logger.warning('选中的原语言测试没有业务候选 case=%s source_tests=%s', ref, matches)
             return []
-        keys = tuple(sorted(merged))
-        candidates = rank_candidates(vectors, business_documents(keys), [merged[key] for key in keys])
+        candidates = [symbol_key(records[key]['key']) for key in sorted(keys)]
         if service.source == 'Python':
             related = '\n'.join([queries[index], *(records[symbol_identity(t)]['source'] for t in matches)])
             for candidate in candidates:
