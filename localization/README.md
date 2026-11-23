@@ -303,6 +303,33 @@ Localization.extract_source(...)
 
 本地通过上游HTTP读取节点、所属类、源码及直接依赖，普通源码单元使用节点坐标，C# partial和C++类外实现按getContent合并原文恢复各片段位置。候选文件中的定义只有获得当前源码单元的引用证据才继续提取，注释、字符串和抽象方法声明不作为调用证据。依赖完整性取决于上游索引覆盖，合并片段无法唯一定位时记录失败并返回空字典
 
+## 启动首批冒烟测试
+
+冒烟测试对一个样例仓库生成全部测试批次，再执行首批组装、映射、源码获取、翻译和运行公测
+
+1. 按上文完成虚拟环境、`default.yaml` 和 `.env` 配置。在一个终端启动上游 CodeGraph。若服务已在 `codegraph.base_url` 指定的地址运行，直接执行下一步
+
+   ```bash
+   cd /home/srp/SRP/localization_planning/codegraph_api
+   node --version
+   npm start
+   ```
+
+   上游使用 Node.js 24。默认监听 `http://127.0.0.1:3000`，需与 `default.yaml` 中的服务地址一致
+
+2. 在另一个终端回到项目根目录，运行指定翻译对的样例
+
+   ```bash
+   cd /home/srp/SRP/localization_planning
+   .venv/bin/python -B -m translation.smoke.run --pair 'C#_to_Java'
+   ```
+
+   每次命令接收一个 `--pair`。运行 `.venv/bin/python -B -m translation.smoke.run --help` 可查看七个可选翻译对。仓库名和目标源码路径由 `translation/smoke/run.py` 的 `SAMPLES` 指定。换仓库时，更新对应翻译对的仓库名与目标源码路径，并确认数据集存在该仓库
+
+   测试工具按目标语言选择。Python 使用虚拟环境中的 pytest，Java 需要 JDK 和 Maven，C# 需要 .NET 8 SDK，C++ 需要编译器、CMake 和 GoogleTest，Rust 需要 Cargo 和 Rust 工具链
+
+结果默认写入 `translation/smoke/output/<运行时间>/`，终端会打印本次样例目录。查看 `summary.json` 确认结果，在翻译对子目录的 `target_project/` 查看翻译代码和组装后的测试文件，在 `tests.log` 查看编译与测试输出。分批、组装清单、映射和源码范围会按执行进度保存为 JSON
+
 ## 文件结构
 
 ```text
