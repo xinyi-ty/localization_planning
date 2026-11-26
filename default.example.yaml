@@ -2,6 +2,8 @@ dataset:
   path: /path/to/dataset
   source_lang: Java
   target_lang: Python
+  repository: ""
+output_dir: translation/output/rounds
 codegraph:
   base_url: http://127.0.0.1:3000
   timeout_seconds: 120

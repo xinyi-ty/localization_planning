@@ -32,19 +32,29 @@ cp -n default.example.yaml default.yaml
 cp -n .env.example .env
 ~~~
 
-在仓库根目录的 `default.yaml` 中配置数据集、翻译对和上游服务。服务器上的 `dataset.path` 使用项目下 `dataset/` 的绝对路径
+在仓库根目录的 `default.yaml` 中配置数据集、源语言、目标语言、仓库、输出目录和上游服务。服务器上的 `dataset.path` 使用项目下 `dataset/` 的绝对路径
 
 ```yaml
 dataset:
   path: /path/to/dataset
   source_lang: Java
   target_lang: Python
+  repository: aventrix_jnanoid
+output_dir: translation/output/rounds
 codegraph:
   base_url: http://127.0.0.1:3000
   timeout_seconds: 120
 ```
 
-主流程读取后，将配置直接传入 `Localization(config)`，实例绑定配置中的翻译对，地址和超时按配置取值
+正式流程根据 `source_lang` 和 `target_lang` 确定翻译对，`dataset.repository` 填该翻译对下的仓库目录名，`output_dir` 指定本次累计测试文件的输出目录。相对输出路径以启动目录为基准，输出目录须尚未存在
+
+在项目根目录启动
+
+```bash
+.venv/bin/python -B -m translation.main
+```
+
+定位实例使用同一份配置中的上游服务地址和超时
 
 ### 功能调用
 
