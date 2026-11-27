@@ -6,10 +6,11 @@ from localization import Localization
 from localization.config import pair_name, public_directories, repository
 
 
-def localize_repository(config, translation_pair, repository_name, output_dir):
+def localize_repository(config, translation_pair, repository_name, output_dir, *, through_batch=None):
     """组装各批测试并定位需要翻译的源码。
 
     使用 config 中的原始数据集，累计测试文件写入 output_dir。
+    through_batch 指定本次交付的最后一批。分批接口仍规划全部公测。
     返回以整数为批次键的结果，以及解释相对源码路径所需的源工程根目录。
     单批缺少映射或入口范围时，抛出带仓库名和批次号的异常。
     """
@@ -28,13 +29,17 @@ def localize_repository(config, translation_pair, repository_name, output_dir):
     # 同一实例复用该仓库的公测分析和源工程索引。
     locator = Localization({**config, "dataset": dataset})
     plan = locator.plan_tests(pair, repository_name)
-    # plan 保存每批新增用例，组装结果则保存截至该批的累计测试文件。
-    test_files = locator.assemble_tests(plan, test_dirs, output_dir=output)
-    # 映射接口校验批次从 1 连续递增，整份计划一次传入。
-    matches = locator.map_tests(repository_name, plan)
+    # 组装用完整计划校验未来用例，映射和源码获取只处理本次交付的批次。
+    if through_batch is None:
+        test_files = locator.assemble_tests(plan, test_dirs, output_dir=output)
+        selected = plan
+    else:
+        test_files = locator.assemble_tests(plan, test_dirs, output_dir=output, through_batch=through_batch)
+        selected = {number: cases for number, cases in plan.items() if number <= through_batch}
+    matches = locator.map_tests(repository_name, selected)
 
     batches = {}
-    for number, new_cases in plan.items():
+    for number, new_cases in selected.items():
         functions = matches[number]
         if not functions:
             raise ValueError(f"{repository_name} 第 {number} 批映射未返回源函数")

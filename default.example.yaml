@@ -4,6 +4,8 @@ dataset:
   target_lang: Python
   repository: ""
 output_dir: translation/output/rounds
+# 可按仓库提供自行编写的完整构建配置，例如声明目标依赖或 Rust crate 名。
+# test_config_path: /path/to/target-build-config
 codegraph:
   base_url: http://127.0.0.1:3000
   timeout_seconds: 120

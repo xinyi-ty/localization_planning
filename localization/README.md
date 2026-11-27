@@ -46,15 +46,25 @@ codegraph:
   timeout_seconds: 120
 ```
 
-正式流程根据 `source_lang` 和 `target_lang` 确定翻译对，`dataset.repository` 填该翻译对下的仓库目录名，`output_dir` 指定本次累计测试文件的输出目录。相对输出路径以启动目录为基准，输出目录须尚未存在
+正式入口读取仓库、翻译对和运行目录。分批覆盖全部公测，组装、映射、源码获取、翻译和 Docker 公测只执行首批。相对输出路径以启动目录为基准，运行目录须尚未存在
 
-在项目根目录启动
+在项目根目录启动，运行前确认模型服务、CodeGraph 和 Docker 可用
 
 ```bash
-.venv/bin/python -B -m translation.main
+.venv/bin/python -m translation.main
 ```
 
-定位实例使用同一份配置中的上游服务地址和超时
+首批项目构建配置保存在 `translation/system_prompt.py`。Python 目标工程会生成 `requirements.txt`，声明测试依赖。程序把实际使用的配置写入目标工程，并将同一份原文放入翻译系统提示词。仓库需要额外依赖或特定构建参数时，可在 `default.yaml` 中通过 `test_config_path` 指向自行编写的配置
+
+首次部署或修改工具链后，在项目根目录构建统一的本地测试镜像
+
+```bash
+bash docker/build_image.sh
+```
+
+`docker/Dockerfile` 在同一个镜像中安装五种目标语言的测试工具链，并在构建时检查工具版本。Dockerfile 直接安装 pytest，构建和测试使用固定的 `localization-test:latest` 标签。测试时复用镜像，容器退出后自动删除
+
+运行结果写到 `workspace/<翻译对>/<仓库>/target_project/`，首批请求、模型回复、测试日志和摘要写到 `logs/<翻译对>/<仓库>/batch_001/`。失败时命令返回非零并保留已产生的文件
 
 ### 功能调用
 
