@@ -1,4 +1,5 @@
 """先匹配原语言测试，再召回并核验各用例对应的源业务函数。"""
+from collections import Counter
 from functools import cache
 import json
 import logging
@@ -10,11 +11,13 @@ from torch.nn import functional as F
 from transformers import AutoModel, AutoTokenizer
 
 from . import llm
-from .codegraph import symbol_key, symbol_identity
+from .codegraph import index_identity, index_key, symbol_identity, symbol_key
 from .config import load_config
-from .file_context import SourceText, check_snapshot, code_text
+from .file_context import check_snapshot, code_text
 from .prompts import MAPPING_REVIEW_PROMPT, SOURCE_TEST_REVIEW_PROMPT, build_messages
-from .public_test_analysis import is_test, reference_identity, required_units, unit_identity
+from .public_test_analysis import (
+    call_evidence, is_test, reference_identity, required_units, test_label, unit_evidence, unit_identity,
+)
 from .public_test_plan import finalize_batches
 
 logger = logging.getLogger(__name__)
@@ -80,7 +83,7 @@ def test_context(analysis, case, graph):
     file = case['case']['filePath']
     selected.update(unit_identity(unit) for unit in analysis['units']
                     if unit['filePath'] == file and unit['kind'] != 'test')
-    sections = [f"Test case: {case['case']['name']}\n{units[unit_identity(case['unit'])]['source']}"]
+    sections = [f"Test case: {test_label(case)}\n{units[unit_identity(case['unit'])]['source']}"]
     for identity in sorted(selected - {unit_identity(case['unit'])}):
         unit = units[identity]
         sections.append(f"Supporting code ({unit['filePath']}):\n{unit['source']}")
@@ -91,6 +94,9 @@ def test_context(analysis, case, graph):
     context = ''.join(line for number, line in enumerate(lines, 1) if number not in occupied)
     if context.strip():
         sections.append('File context:\n' + context)
+    evidence = unit_evidence(analysis, selected)
+    if evidence:
+        sections.append('Resolved type and decorator references:\n' + json.dumps(evidence, ensure_ascii=False))
     return '\n\n'.join(sections)
 
 
@@ -130,103 +136,104 @@ def owner_name(record):
     return record['node'].get('qualifiedName', '').rpartition('::')[0]
 
 
-def python_bound_calls(record, records, test_files, source_file):
-    """从同一测试类的 setUp、当前用例和明确导入补充 Python 成员引用。"""
+def python_instance_members(record, graph, root, records):
+    """静态索引未跨 setUp 关联接收者时，以初始化关系和类型上下文核对显式访问。"""
     path = record['key']['filePath']
     owner = owner_name(record)
-    setup = [r['source'] for r in records.values() if owner and owner_name(r) == owner
-             and r['key']['filePath'] == path and r['key']['name'] == 'setUp']
+    setup = [item for item in records.values() if owner and owner_name(item) == owner
+             and item['key']['filePath'] == path and item['key']['name'] == 'setUp']
     bindings = {}
-    body = code_text(record['source'], 'Python')
-    for text in [*(code_text(src, 'Python') for src in setup), body]:
-        bindings.update(re.findall(r'(?m)^\s*((?:self\.)?[A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\(', text))
-    imports = {}
-    original = code_text(source_file(path), 'Python')
-    for module, imported in re.findall(r'(?m)^from\s+([\w.]+)\s+import\s+([^\n;]+)', original):
-        for part in imported.split(','):
-            name, _, alias = part.strip().partition(' as ')
-            imports[alias or name] = (module.lstrip('.').replace('.', '/'), name)
-
-    for receiver, member, invoked in re.findall(r'(?<![\w.])((?:self\.)?[A-Za-z_]\w*)\.([A-Za-z_]\w*)[ \t]*(\()?', body):
-        binding = imports.get(bindings.get(receiver))
-        if binding is None:
+    for item in [*setup, record]:
+        body = code_text(item['source'], 'Python')
+        assignments = re.findall(r'(?m)^\s*((?:self\.)?[A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\(', body)
+        if assignments:
+            types = graph.callees(root, item['key'])['instantiates']
+            for receiver, name in assignments:
+                matches = [key for key in types if key['name'] == name]
+                bindings[receiver] = (matches[0], item['key']) if len(matches) == 1 else None
+    accesses = re.findall(r'(?<![\w.])((?:self\.)?[A-Za-z_]\w*)\.([A-Za-z_]\w*)[ \t]*(\()?',
+                          code_text(record['source'], 'Python'))
+    for receiver, member, invoked in accesses:
+        if not (binding := bindings.get(receiver)):
             continue
-        module, name = binding
-        scoped = [r for r in records.values() if r['key']['name'] == member
-                  and r['key']['filePath'] not in test_files
-                  and not is_test_file(PurePosixPath(r['key']['filePath']))
-                  and ('/' + r['key']['filePath']).endswith(('/' + module + '.py', '/' + module + '/__init__.py'))]
-        matches = [r for r in scoped if owner_name(r).rsplit('::', 1)[-1] == name]
-        if not matches:
-            matches = [r for r in scoped if python_type_context(r, name, source_file)]
-        if len(matches) != 1:
-            continue
-        candidate = matches[0]
-        if not invoked:
-            lines = source_file(candidate['key']['filePath']).splitlines()
-            line = candidate['key']['startLine'] - 1
-            if not any(x.strip() in {'@property', '@cached_property', '@functools.cached_property'}
-                       for x in lines[max(0, line-1):line+1]):
-                continue
-        yield candidate
+        target, initializer = binding
+        context = graph.type_context(root, target)
+        owners = [(target, context['members'])]
+        if not any(item['key']['name'] == member for item in context['members']):
+            owners = [(base['key'], graph.type_context(root, base['key'])['members'])
+                      for base in context['bases'] if base['node']['kind'] in {'class', 'struct', 'interface'}]
+        matches = {}
+        for scope, nodes in owners:
+            for node in nodes:
+                key = index_identity(node['key'])
+                candidate = records.get(key)
+                if not candidate or node['key']['name'] != member:
+                    continue
+                if not invoked:
+                    lines = graph.content(root, file=node['key']['filePath'])['source'].splitlines()
+                    start = node['key']['startLine'] - 1
+                    if not any(line.strip() in {'@property', '@cached_property', '@functools.cached_property'}
+                               for line in lines[max(0, start - 1):start + 1]):
+                        continue
+                matches[key] = (candidate, scope)
+        if len(matches) == 1:
+            candidate, scope = next(iter(matches.values()))
+            evidence = [{'kind': 'instantiates', 'source': symbol_key(initializer), 'target': symbol_key(target)}]
+            if index_identity(scope) != index_identity(target):
+                evidence.append({'kind': 'base_member', 'source': symbol_key(target), 'target': symbol_key(scope)})
+            yield candidate, evidence
 
 
-def python_type_context(record, test_context, source_file):
-    owner = owner_name(record).rsplit('::', 1)[-1]
-    if not owner:
-        return []
-    source = code_text(source_file(record['key']['filePath']), 'Python')
-    return [decl.strip() for decl, child in re.findall(
-        r'(?m)^([ \t]*class\s+([A-Za-z_]\w*)\s*\(\s*' + re.escape(owner) + r'\s*\)\s*:)', source)
-        if re.search(r'\b' + re.escape(child) + r'\b', test_context)]
-
-
-def source_business_calls(test, graph, root, language, records, test_files, source_file):
+def source_business_calls(test, graph, root, language, records, test_files):
     """沿原测试及其辅助函数查找业务入口。"""
-    pending, seen, functions = [test], set(), []
+    pending, seen, functions, evidence = [test], set(), [], []
     while pending:
         record = pending.pop()
-        identity = symbol_identity(record['key'])
+        identity = index_identity(record['key'])
         if identity in seen:
             continue
         seen.add(identity)
         file = PurePosixPath(record['key']['filePath'])
         if file.as_posix() in test_files or is_test_file(file):
-            calls = graph.callees(root, record['node'])['functions']
-            pending.extend(records[key] for target in calls if (key := symbol_identity(target)) in records)
+            response = graph.callees(root, record['node'])
+            evidence.extend(call_evidence(record['key'], response))
+            pending.extend(records[key] for target in response['functions']
+                           if (key := index_identity(target)) in records)
             if language == 'Python':
-                pending.extend(python_bound_calls(record, records, test_files, source_file))
+                for candidate, relations in python_instance_members(record, graph, root, records):
+                    pending.append(candidate)
+                    evidence.extend(relations)
         else:
             source = record['source']
             if (source.strip() and not record['node'].get('isAbstract')
                     and (language == 'Python' or '{' in source or '=>' in source)):
                 functions.append(record)
-    return functions
+    return functions, evidence
 
 
-def verify_candidates(case, context, candidates, records, source_language, target_language):
+def verify_candidates(case, context, candidates, records, source_language, target_language, evidence):
     """使用已有函数原文核验候选，仅将有效编号转换回三元key。"""
     payload = {'source_language': source_language, 'target_language': target_language,
-               'case': case, 'test_context': context,
+               'case': case, 'test_context': context, 'call_evidence': evidence,
                'candidates': [
                    {'number': number, 'key': symbol_key(candidate),
-                    'qualified_name': records[symbol_identity(candidate)]['node'].get('qualifiedName', candidate['name']),
-                    'source': records[symbol_identity(candidate)]['source'],
-                    **({'type_context': candidate['type_context']} if candidate.get('type_context') else {})}
+                    'qualified_name': records[index_identity(candidate)]['node'].get('qualifiedName', candidate['name']),
+                    'source': records[index_identity(candidate)]['source']}
                    for number, candidate in enumerate(candidates, 1)]}
     selected, usage = review_numbers(MAPPING_REVIEW_PROMPT, payload, len(candidates), '映射')
-    result = [symbol_key(candidates[i - 1]) for i in selected]
+    result = [index_key(candidates[i - 1]) for i in selected]
     if result:
         logger.info('映射核验完成 case=%s selected=%s usage=%s', case, result, usage)
     return result
 
 
-def verify_source_tests(case, context, shortlist, functions, records, source_language, target_language):
+def verify_source_tests(case, context, shortlist, results, records, source_language, target_language):
     payload = {'source_language': source_language, 'target_language': target_language,
                'case': case, 'test_context': context, 'source_tests': [
-                   {'number': i, 'key': symbol_key(test), 'source': records[symbol_identity(test)]['source'],
-                    'business_entries': [r['node'].get('qualifiedName', r['key']['name']) for r in entries]}
-                   for i, (test, entries) in enumerate(zip(shortlist, functions), 1)]}
+                   {'number': i, 'key': symbol_key(test), 'source': records[index_identity(test)]['source'],
+                    'business_entries': [r['node'].get('qualifiedName', r['key']['name']) for r in entries],
+                    'call_evidence': evidence}
+                   for i, (test, (entries, evidence)) in enumerate(zip(shortlist, results), 1)]}
     selected, _ = review_numbers(SOURCE_TEST_REVIEW_PROMPT, payload, len(shortlist), '原测试')
     return [shortlist[i - 1] for i in selected]
 
@@ -272,7 +279,8 @@ def map_tests(service, project, batches):
         logger.warning('映射未识别到原语言测试 root=%s', inventory['root'])
         check_snapshot(analysis['snapshot'])
         return {batch_no: [] for batch_no in batches}
-    records = {symbol_identity(record['key']): record for record in inventory['functions']}
+    records = {index_identity(record['key']): record for record in inventory['functions']}
+    public_counts = Counter(symbol_identity(record['key']) for record in records.values())
     test_files = {record['key']['filePath'] for record in originals}
     root = Path(inventory['root'])
     if service._embedding_model is None:
@@ -285,12 +293,8 @@ def map_tests(service, project, batches):
     query_indices = {identity: index for index, identity in enumerate(identities)}
 
     @cache
-    def source_file(path):
-        return SourceText((root / path).read_bytes(), python=service.source == 'Python').text
-
-    @cache
     def business_functions(key):
-        return source_business_calls(records[key], service.graph, root, service.source, records, test_files, source_file)
+        return source_business_calls(records[key], service.graph, root, service.source, records, test_files)
 
     def map_case(ref):
         index = query_indices[reference_identity(ref)]
@@ -298,36 +302,35 @@ def map_tests(service, project, batches):
         shortlist = rank_candidates(vectors, test_documents, originals, top_k=SOURCE_TEST_LIMIT)
         check_snapshot(analysis['snapshot'])
         check_snapshot(inventory['snapshot'])
-        functions = [business_functions(symbol_identity(test)) for test in shortlist]
-        entry_sets = [{symbol_identity(r['key']) for r in items} for items in functions]
+        results = [business_functions(index_identity(test)) for test in shortlist]
+        entry_sets = [{index_identity(r['key']) for r in items} for items, _ in results]
         if not any(entry_sets):
             logger.warning('原语言测试未定位到候选业务函数 case=%s source_tests=%s', ref, shortlist)
             return []
         # 候选测试导向不同业务入口时，再调用模型复核测试匹配结果。
         matches = shortlist[:1]
         if any(keys != entry_sets[0] for keys in entry_sets[1:]):
-            matches = verify_source_tests(ref, queries[index], shortlist, functions, records,
+            matches = verify_source_tests(ref, queries[index], shortlist, results, records,
                                           service.source, service.target)
-        keys = {symbol_identity(r['key'])
-                for test in matches for r in business_functions(symbol_identity(test))}
+        keys, evidence = set(), []
+        for test in matches:
+            entries, relations = business_functions(index_identity(test))
+            keys.update(index_identity(row['key']) for row in entries)
+            evidence.extend(relations)
         if not keys:
             logger.warning('选中的原语言测试没有业务候选 case=%s source_tests=%s', ref, matches)
             return []
-        candidates = [symbol_key(records[key]['key']) for key in sorted(keys)]
-        if service.source == 'Python':
-            related = '\n'.join([queries[index], *(records[symbol_identity(t)]['source'] for t in matches)])
-            for candidate in candidates:
-                context = python_type_context(records[symbol_identity(candidate)], related, source_file)
-                if context:
-                    candidate['type_context'] = context
+        candidates = [records[key]['key'] for key in sorted(keys)]
         logger.info('映射候选 batch=%s case=%s source_tests=%s candidates=%s', batch_no, ref, matches, candidates)
-        return verify_candidates(ref, queries[index], candidates, records, service.source, service.target)
+        return verify_candidates(ref, queries[index], candidates, records, service.source, service.target, evidence)
 
-    # 一批内的多个用例可能验证同一函数，按原始三元 key 汇总。
     mapped = {}
     for batch_no, batch_refs in batches.items():
-        selected = {symbol_identity(key): key for ref in batch_refs for key in map_case(ref)}
-        mapped[batch_no] = list(selected.values())
+        selected = {index_identity(key): key for ref in batch_refs for key in map_case(ref)}
+        for key in selected.values():
+            if public_counts[symbol_identity(key)] > 1:
+                raise ValueError(f'业务入口的三元定位键无法区分同名节点：{symbol_key(key)}')
+        mapped[batch_no] = [symbol_key(key) for key in selected.values()]
     check_snapshot(analysis['snapshot'])
     check_snapshot(inventory['snapshot'])
     return mapped

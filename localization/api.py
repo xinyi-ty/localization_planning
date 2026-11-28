@@ -91,4 +91,6 @@ class Localization:
         except (ValueError, OSError, GraphError) as exc:
             logging.getLogger(__name__).error('源码提取失败 repo=%s entries=%s [%s]：%s',
                 repository_name, functions, getattr(exc, 'code', type(exc).__name__), exc)
+            if isinstance(exc, GraphError) and exc.details.get('candidates'):
+                logging.getLogger(__name__).error('上游歧义候选：%s', exc.details['candidates'])
             return {}

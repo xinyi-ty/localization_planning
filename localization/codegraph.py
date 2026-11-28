@@ -27,8 +27,24 @@ def symbol_identity(value):
     return key['filePath'], key['name'], key['startLine']
 
 
+def index_key(value):
+    """保留上游对同一索引中的冲突符号提供的定位信息。"""
+    key = symbol_key(value)
+    if 'symbolId' in value:
+        token = value['symbolId']
+        if not isinstance(token, str) or not token:
+            raise ValueError('symbolId须为非空字符串')
+        key['symbolId'] = token
+    return key
+
+
+def index_identity(value):
+    key = index_key(value)
+    return key['filePath'], key['name'], key['startLine'], key.get('symbolId', '')
+
+
 def rebase_key(value, from_root, to_root):
-    """在工程与公测索引目录之间转换同一符号的相对路径。"""
+    """在工程与公测目录之间转换公开定位键，索引标识留在原索引。"""
     key = symbol_key(value)
     origin, target = Path(from_root).resolve(strict=True), Path(to_root).resolve(strict=True)
     path = (origin / key['filePath']).resolve(strict=True)
@@ -70,7 +86,7 @@ class CodeGraph:
     def call(self, method, root, **parameters):
         cache = _request_cache.get()
         # 文件原文查询用于末尾一致性核验，必须重新读取。
-        reusable = method in {'getAllFunctions', 'getCallees', 'getLocation'} or (
+        reusable = method in {'getAllFunctions', 'getCallees', 'getLocation', 'getTypeContext', 'getDependencies'} or (
             method == 'getContent' and parameters.get('input', {}).get('kind') != 'file')
         key = (id(self), str(root), method, json.dumps(parameters, sort_keys=True))
         if cache is not None and reusable and key in cache:
@@ -102,10 +118,6 @@ class CodeGraph:
         except (ValueError, UnicodeError) as exc:
             raise GraphError("GRAPH_PROTOCOL_ERROR", "CodeGraph未返回有效JSON") from exc
 
-    @staticmethod
-    def key(node):
-        return symbol_key(node)
-
     def prepare(self, root, language):
         """同步已有索引，首次读取工程时按指定语言建库。"""
         try:
@@ -122,49 +134,74 @@ class CodeGraph:
         if not isinstance(result, dict) or result.get("success") is False or any(result.get(k) for k in ("filesErrored", "errors", "failedFilePaths")):
             raise GraphError("GRAPH_INDEX_ERROR", "CodeGraph索引未完整完成")
 
-    def functions(self, root):
-        """将函数清单的三元 key 补全为带原生节点 ID 和源码范围的记录。"""
+    def function_keys(self, root):
         rows = self.call("getAllFunctions", root)
-        if not isinstance(rows, list) or any(not isinstance(n, dict) or not {"name", "filePath", "startLine"} <= n.keys() for n in rows):
-            raise GraphError("GRAPH_PROTOCOL_ERROR", "函数清单缺少必要节点字段")
-        resolved = []
+        if not isinstance(rows, list):
+            raise GraphError("GRAPH_PROTOCOL_ERROR", "函数清单须为数组")
         for row in rows:
-            if 'id' not in row:
-                try:
-                    node = self.content(root, node=row).get('node')
-                except GraphError as exc:
-                    if exc.code!='AMBIGUOUS_NODE':raise
-                    # 保留与三元 key 一致的可调用候选，供后续定位时核对歧义。
-                    candidates=exc.details.get('candidates',[])
-                    callable_nodes=[c for c in candidates if isinstance(c,dict) and c.get('kind') in {'function','method','constructor'}
-                                    and {'id','name','filePath','startLine'}<=c.keys() and self.key(c)==self.key(row)]
-                    if not callable_nodes:raise
-                    resolved.extend(callable_nodes)
-                    continue
-                if not isinstance(node, dict) or not {'id', 'name', 'filePath', 'startLine'} <= node.keys() or self.key(node) != self.key(row):
-                    raise GraphError('GRAPH_PROTOCOL_ERROR', '函数key未能恢复为一致的原生节点')
-                row = node
-            resolved.append(row)
-        return list({n["id"]:n for n in resolved}.values())
+            index_key(row)
+        return rows
+
+    def functions(self, root):
+        """查出函数的原生范围，并保留上游附带的消歧键和测试身份。"""
+        nodes = []
+        for row in self.function_keys(root):
+            result = self.content(root, node=row)
+            node = result['node']
+            if 'id' not in node:
+                raise GraphError('GRAPH_PROTOCOL_ERROR', '函数节点缺少原生ID')
+            if 'testIdentity' in result:
+                node['testIdentity'] = result['testIdentity']
+            nodes.append({**node, **row})
+        return nodes
 
     def callees(self, root, node):
-        result = self.call("getCallees", root, key=self.key(node))
-        if not isinstance(result, dict) or not isinstance(result.get('edges'), list) or any(not isinstance(e, dict) or not {'source','target'} <= e.keys() for e in result['edges']):
-            raise GraphError('GRAPH_PROTOCOL_ERROR', '调用结果缺少合法的edges')
+        result = self.call("getCallees", root, key=index_key(node))
+        if not isinstance(result, dict) or any(
+                not isinstance(result.get(field), list)
+                for field in ('functions', 'decorators', 'instantiates', 'edges')):
+            raise GraphError('GRAPH_PROTOCOL_ERROR', '调用结果缺少关系数组')
+        if any(not isinstance(edge, dict) or not {'kind', 'source', 'target'} <= edge.keys()
+               for edge in result['edges']):
+            raise GraphError('GRAPH_PROTOCOL_ERROR', '调用结果包含无效关系边')
+        edges = [edge for edge in result['edges']
+                 if (edge.get('metadata') or {}).get('synthesizedBy') != 'interface-impl']
+        if len(edges) != len(result['edges']):
+            # 接口声明到全部实现的分派边不能说明某个实现实际被调用。
+            direct = {edge['target'] for edge in edges if edge['kind'] == 'calls'}
+            result = {**result, 'edges': edges,
+                      'functions': [key for key in result['functions']
+                                    if self.content(root, node=key)['node']['id'] in direct]}
+        return result
+
+    def type_context(self, root, node):
+        result = self.call("getTypeContext", root, key=index_key(node))
+        if not isinstance(result, dict) or any(
+                not isinstance(result.get(field), list)
+                for field in ('members', 'bases', 'initializers', 'bindings', 'unresolved')):
+            raise GraphError('GRAPH_PROTOCOL_ERROR', '类型上下文缺少关系数组')
         return result
 
     def location(self, root, node):
-        result = self.call("getLocation", root, key=self.key(node))
+        result = self.call("getLocation", root, key=index_key(node))
         if (not isinstance(result, dict)
                 or not isinstance(result.get('filePath'), str)
-                or result.get('key') != self.key(node)
+                or not isinstance(result.get('key'), dict)
+                or index_key(result['key']) != index_key(node)
                 or not (result.get('container') is None or isinstance(result.get('container'), dict))):
             raise GraphError('GRAPH_PROTOCOL_ERROR', '所属类型结果缺少合法位置')
         return result
 
     def content(self, root, node=None, file=None):
-        selector = {"kind": "file", "filePath": file} if file is not None else self.key(node)
+        selector = {"kind": "file", "filePath": file} if file is not None else index_key(node)
         result = self.call("getContent", root, input=selector)
         if not isinstance(result, dict) or not isinstance(result.get('source'),str) or not isinstance(result.get('filePath'),str):
             raise GraphError('GRAPH_PROTOCOL_ERROR', '源码结果缺少合法source或filePath')
+        if node is not None:
+            resolved = result.get('node')
+            if not isinstance(resolved, dict) or symbol_key(resolved) != symbol_key(selector):
+                raise GraphError('GRAPH_PROTOCOL_ERROR', '源码节点与请求的定位键不一致')
+            if 'symbolId' in selector and selector['symbolId'] != resolved.get('id'):
+                raise GraphError('GRAPH_PROTOCOL_ERROR', '源码节点与请求的symbolId不一致')
+            result = {**result, 'node': {**resolved, **selector}}
         return result

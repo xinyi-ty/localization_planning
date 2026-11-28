@@ -13,7 +13,7 @@ from .codegraph import GraphError
 from .file_context import SourceText, check_snapshot, snapshot_roots, prompt_files, python_statements
 from .prompts import RANGE_ASSEMBLY_PROMPT, build_messages
 from .public_test_analysis import (analyze_tests, reference_identity, unit_identity, unit_reference,
-                            import_bindings, binding_name, required_units)
+                            import_bindings, binding_name, required_units, test_label, unit_evidence)
 from .public_test_plan import finalize_batches
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ def prepare_round(batches, batch_no, previous_files, analysis, graph):
     return {
         'context': {'language': analysis['language'], 'cases': cases,
                     'previous_files': deepcopy(previous_files), 'new_cases': batches[batch_no],
-                    'files': files},
+                    'files': files, 'call_evidence': unit_evidence(analysis, needed)},
         'constraints': {'language': analysis['language'], 'cases': cases,
                         'required_units': required,
                         'target_layout': list(analysis['snapshot']['roots'])},
@@ -156,7 +156,7 @@ def _validate_files(files, constraints, analysis, graph):
     # 生成文件的行号会变化，以所属类型、名称和原文关联原始用例，保留出现次数。
     def case_signature(result, row):
         unit = next(unit for unit in result['units'] if unit_identity(unit) == unit_identity(row['unit']))
-        return row['case']['filePath'], row['container'], row['case']['name'], unit['source'].strip()
+        return row['case']['filePath'], row['container'], test_label(row), unit['source'].strip()
     expected = Counter(case_signature(analysis, row) for row in analysis['cases'] if row['case'] in constraints['cases'])
     actual = Counter(case_signature(observed, row) for row in observed['cases'])
     if actual != expected:

@@ -7,7 +7,7 @@ import posixpath
 import re
 import tokenize
 
-from .codegraph import GraphError, symbol_identity
+from .codegraph import GraphError, index_identity
 from .file_context import code_text
 
 logger = logging.getLogger(__name__)
@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 
 def collect_file_dependencies(
         spans, unit_name, language, project_files, nodes, identifiers, function_references, *,
-        source, content, owning_unit, dependency_files,
+        source, owning_unit, dependency_files,
 ):
-    """筛选有引用依据的文件依赖，收集导入、初始化和外部依赖。"""
+    """在已解析的依赖文件中核对引用，并保留导入原文。"""
     candidates, dependency_ranges, external = {}, {}, []
     for span in spans:
         file = span['filePath']
@@ -34,34 +34,10 @@ def collect_file_dependencies(
                 continue
             target = owning_unit(node)
             # 类成员调用必须关联其所属类型；独立函数按实际引用名称筛选。
-            same_unit = symbol_identity(target) == symbol_identity(node)
+            same_unit = index_identity(target) == index_identity(node)
             if ((not same_unit and target['name'] in identifiers)
                     or (same_unit and node['name'] in function_references)):
-                matches_by_name[target['name']][symbol_identity(target)] = target
-        # 没有方法的类型也可能是必要依赖。文本仅提供检索key，范围由上游节点确认。
-        for dependency_file in files:
-            dependency_source = source(dependency_file)
-            clean = code_text(dependency_source, language)
-            for match in re.finditer(r'\b(?:class|struct|interface)\s+([A-Za-z_]\w*)', clean):
-                if match[1] in identifiers:
-                    target = {'name': match[1], 'filePath': dependency_file,
-                              'startLine': dependency_source[:match.start()].count('\n') + 1}
-                    try:
-                        content(target)
-                    except GraphError as exc:
-                        if exc.code != 'NODE_NOT_FOUND':
-                            raise
-                        # 未索引头文件只保留可直接确认完整的一行声明，不扩大为整个头文件。
-                        declaration = clean.splitlines()[target['startLine'] - 1]
-                        if language == 'C++' and re.fullmatch(
-                                r'\s*(?:class|struct)\s+' + re.escape(match[1]) + r'\s*\{[^{}]*\};\s*', declaration):
-                            line = target['startLine']
-                            dependency_ranges[(dependency_file, line, line)] = {
-                                **target, 'endLine': line}
-                        else:
-                            logger.warning('上游未索引依赖声明，无法确认完整范围：%s', target)
-                        continue
-                    matches_by_name[target['name']][symbol_identity(target)] = target
+                matches_by_name[target['name']][index_identity(target)] = target
         # 文件级候选无法证明同名符号的身份，只补充唯一匹配。图中已定位的引用由调用方保留。
         for matches in matches_by_name.values():
             if len(matches) == 1:
@@ -198,7 +174,7 @@ def collect_python_dependencies(spans, unit_name, project_files, statements, sou
                             raise
                         logger.warning('上游未索引 Python 依赖声明，无法确认范围：%s', key)
                     else:
-                        candidates[symbol_identity(key)] = key
+                        candidates[index_identity(key)] = key
                 continue
             # 保留用到的模块绑定及包加载时执行的普通顶层语句。
             bound = (token.type == tokenize.NAME and token.string in by_name

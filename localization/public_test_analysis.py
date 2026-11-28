@@ -5,8 +5,8 @@ import os
 from pathlib import Path
 import re
 
-from .codegraph import CodeGraph, GraphError, symbol_identity, rebase_key
-from .config import SDK_LANGUAGES, load_config, language as normalize_language
+from .codegraph import rebase_key, symbol_identity, symbol_key
+from .config import SDK_LANGUAGES, public_directories, language as normalize_language
 from .file_context import SourceText, public_bundle, source_snapshot, check_snapshot, snapshot_roots
 
 
@@ -48,7 +48,7 @@ def is_test(node, source, file, language):
         return bool(re.search(r'\[(?:[\w.]+\.)?(?:Fact|Theory|Test|TestCase|TestCaseSource|TestMethod|DataTestMethod)\b', source))
     if language == 'Rust':
         return bool(re.search(r'#\[\s*(?:[\w:]+::)?test\s*\]', source))
-    return bool(re.search(r'\b(?:TEST|TEST_F|TEST_P|TYPED_TEST)\s*\(', source))
+    return 'testIdentity' in node
 
 
 def import_bindings(line):
@@ -100,30 +100,30 @@ def _collect_test_nodes(directories, root, files, language, graph):
                     'node': node}
             units.append(unit)
             if test:
-                try:
-                    located = graph.location(directory, node)
-                except GraphError as exc:
-                    if exc.code != 'AMBIGUOUS_NODE':
-                        raise
-                    located = {}
-                # 用例路径相对于目标工程，原生节点路径相对于公测索引目录。
+                located = graph.location(directory, node)
+                # 公测输出使用工程相对路径，查询继续使用当前索引的原生节点。
                 ref = rebase_key(node, directory, root)
                 container = located.get('container')
                 scope = ''
                 if container:
                     parent = graph.content(directory, node=container)['node']
                     scope = parent.get('qualifiedName', container['name'])
-                rows.append({'case': ref, 'unit': unit_reference(unit),
-                             'container': scope})
+                rows.append({'case': ref, 'unit': unit_reference(unit), 'container': scope,
+                             'testIdentity': node.get('testIdentity')})
     if not rows:
         raise ValueError('上游索引和测试标记未识别到公测用例')
+    seen = set()
+    for row in rows:
+        identity = reference_identity(row['case'])
+        if identity in seen:
+            raise ValueError(f"公测三元定位键无法区分同名节点：{row['case']}")
+        seen.add(identity)
     return units, rows
 
 
 def analyze_tests(test_directories, language, graph):
     """在同一公测快照上识别用例、源码单元和文件内容。"""
     name = normalize_language(language)
-    graph = graph or CodeGraph(load_config()['codegraph'])
     directories = [test_directories] if isinstance(test_directories, (str, Path)) else list(test_directories)
     directories = list(dict.fromkeys(Path(p).resolve(strict=True) for p in directories))
     if not directories or any(not p.is_dir() for p in directories):
@@ -154,33 +154,64 @@ def analyze_tests(test_directories, language, graph):
     return result
 
 
+def indexed_test_key(graph, project, case):
+    """从原公测索引恢复公开用例对应的内部定位键。"""
+    origin = next((root for root in public_directories(project)
+                   if (project / case['filePath']).is_relative_to(root)), None)
+    if origin is None:
+        raise ValueError(f"用例不在原公测目录中：{case}")
+    key = rebase_key(case, project, origin)
+    matches = [row for row in graph.function_keys(origin) if symbol_key(row) == key]
+    if len(matches) != 1:
+        raise ValueError(f"原公测三元定位键未唯一命中：{case}，候选：{matches}")
+    return origin, matches[0]
+
+
+def test_label(row):
+    identity = row.get('testIdentity')
+    return identity['displayName'] if identity else row['case']['name']
+
+
+def call_evidence(node, response):
+    """记录已解析的装饰与实例化关系，供核验引用。"""
+    return [{'kind': kind, 'source': symbol_key(node), 'target': symbol_key(target)}
+            for kind, field in (('decorates', 'decorators'), ('instantiates', 'instantiates'))
+            for target in response[field]]
+
+
 def _test_calls(analysis, graph):
-    """从公测索引查询调用关系，每个目录独立匹配原生节点 ID。"""
+    """按关系类别和公测范围收集必保项，类型关系单独作为证据。"""
     snapshot = analysis['snapshot']
     root = Path(snapshot['root'])
-    calls = defaultdict(set)
+    calls, evidence = defaultdict(set), {}
     for directory in snapshot_roots(snapshot):
         prefix = directory.relative_to(root)
         units = {unit['node']['id']: unit for unit in analysis['units']
                  if Path(unit['filePath']).is_relative_to(prefix)}
         for unit in units.values():
-            try:
-                response = graph.callees(directory, unit['node'])
-            except GraphError as exc:
-                if exc.code != 'AMBIGUOUS_NODE':
-                    raise
-                continue
+            response = graph.callees(directory, unit['node'])
+            identity = unit_identity(unit)
+            for relation in call_evidence(unit['node'], response):
+                for end in ('source', 'target'):
+                    key = relation[end]
+                    key['filePath'] = (prefix / key['filePath']).as_posix()
+                evidence.setdefault(identity, []).append(relation)
             for edge in response['edges']:
-                owner, target = units.get(edge['source']), units.get(edge['target'])
-                if owner and target:
-                    calls[unit_identity(owner)].add(unit_identity(target))
-    return dict(calls)
+                target = units.get(edge['target'])
+                if edge['source'] == unit['node']['id'] and target and (
+                        edge['kind'] == 'calls' or edge['kind'] == 'decorates' and target['kind'] == 'helper'):
+                    calls[identity].add(unit_identity(target))
+    return dict(calls), evidence
+
+
+def unit_evidence(analysis, selected):
+    return [row for unit in sorted(selected) for row in analysis['call_evidence'].get(unit, ())]
 
 
 def required_units(analysis, cases, graph):
     """按需查询公测调用图，收集可达的必要代码单元。"""
     if 'calls' not in analysis:
-        analysis['calls'] = _test_calls(analysis, graph)
+        analysis['calls'], analysis['call_evidence'] = _test_calls(analysis, graph)
     selected = {unit_identity(row['unit']) for row in analysis['cases'] if row['case'] in cases}
     pending = list(selected)
     while pending:

@@ -143,7 +143,7 @@ def run_repository(config):
             batch_summary.update(translation)
 
             phase = "累计公测验证"
-            tested = run_target_tests(locator.target, cumulative_cases, original_tests, candidate, batch_logs)
+            tested = run_target_tests(locator.target, cumulative_cases, original_tests, candidate, batch_logs, locator.graph)
             batch_summary.update(tested)
 
             phase = "发布本批结果"

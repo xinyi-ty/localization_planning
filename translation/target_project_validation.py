@@ -1,4 +1,4 @@
-"""生成目标工程的构建配置，并在 Docker 中验证首批公测。"""
+"""生成目标工程的构建配置，并在 Docker 中验证累计公测。"""
 
 import json
 from pathlib import Path
@@ -7,10 +7,10 @@ import shlex
 import subprocess
 import xml.etree.ElementTree as ET
 
+from localization.codegraph import request_scope
+from localization.public_test_analysis import indexed_test_key
+
 from .system_prompt import BUILD_CONFIGS, PYTHON_TEST_REQUIREMENTS
-
-
-GTEST_MACRO = re.compile(r"\s*(TEST|TEST_F|TEST_P|TYPED_TEST|TYPED_TEST_P)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)")
 
 
 def rust_modules(cases):
@@ -42,7 +42,8 @@ def prepare_target_test_config(language, cases, project, config):
     return files
 
 
-def expected_tests(language, cases, original_tests):
+@request_scope
+def expected_tests(language, cases, original_tests, graph):
     """使用原文件行号读取测试标识，报告按框架的展示规则比对。"""
     modules = rust_modules(cases) if language == "Rust" else {}
     expected = set()
@@ -52,15 +53,14 @@ def expected_tests(language, cases, original_tests):
             key = file, name
         elif language == "Rust":
             key = modules[file], name
+        elif language == "C++":
+            _, node = indexed_test_key(graph, original_tests, case)
+            identity = node["testIdentity"]
+            key = identity["suite"], identity["name"]
         else:
             original = (original_tests / file).read_text(encoding="utf-8-sig")
             lines = original.splitlines()
-            if language == "C++":
-                match = GTEST_MACRO.match("\n".join(lines[line - 1:]))
-                if not match:
-                    raise ValueError(f"无法从原公测识别 GoogleTest 用例：{file}:{line}")
-                key = match.group(2), match.group(3)
-            elif language == "Java":
+            if language == "Java":
                 package = re.search(r"(?m)^\s*package\s+([\w.]+)\s*;", original)
                 classname = Path(file).stem
                 key = (f"{package[1]}.{classname}" if package else classname), name
@@ -72,10 +72,10 @@ def expected_tests(language, cases, original_tests):
                     raise ValueError(f"无法从原公测识别 .NET 测试类：{file}:{line}")
                 key = ".".join([*namespaces, classes[-1]]), name
         if key in expected:
-            raise ValueError(f"测试报告无法区分同名首批用例：{file}:{line} {key}")
+            raise ValueError(f"测试报告无法区分同名累计用例：{file}:{line} {key}")
         expected.add(key)
     if not expected:
-        raise ValueError("首批预期用例为空")
+        raise ValueError("累计预期用例为空")
     return expected
 
 
@@ -117,9 +117,9 @@ def xml_results(language, reports, project):
             yield key, passed
 
 
-def run_target_tests(language, cases, original_tests, project, logs):
+def run_target_tests(language, cases, original_tests, project, logs, graph):
     """在统一镜像运行本批累计公测，并按原用例身份核对报告。"""
-    expected = expected_tests(language, cases, original_tests)
+    expected = expected_tests(language, cases, original_tests, graph)
     script = Path(__file__).resolve().parents[1] / "docker" / "run_tests.sh"
     log = logs / "tests.log"
     case_files = sorted({case["filePath"] for case in cases})

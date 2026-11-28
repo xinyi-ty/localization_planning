@@ -7,7 +7,7 @@ import re
 import tokenize
 
 from .config import SDK_LANGUAGES, files_under
-from .codegraph import GraphError, symbol_key, symbol_identity
+from .codegraph import index_identity, index_key, symbol_identity
 from .file_context import create_snapshot, check_snapshot, python_statements, code_text
 from .source_dependencies import collect_file_dependencies, collect_python_dependencies
 
@@ -18,7 +18,7 @@ def analyze_source(root, language, graph):
     functions = []
     for node in graph.functions(root):
         content = graph.content(root, node=node)
-        functions.append({'key': symbol_key(node), 'node': content['node'], 'source': content['source']})
+        functions.append({'key': index_key(node), 'node': node, 'source': content['source']})
     check_snapshot(snapshot)
     return {'root': str(root), 'language': language, 'functions': functions, 'snapshot': snapshot}
 
@@ -30,7 +30,7 @@ def extract_source(service, project, functions):
     graph, language = service.graph, service.source
     nodes = [row['node'] for row in inventory['functions']]
     sources, contents, owners, file_dependencies = {}, {}, {}, {}
-    contents.update({symbol_identity(row['key']): {'node': row['node'], 'source': row['source']}
+    contents.update({index_identity(row['key']): {'node': row['node'], 'source': row['source']}
                      for row in inventory['functions']})
     project_files = [p.relative_to(root).as_posix() for p in files_under(root)]
 
@@ -47,13 +47,13 @@ def extract_source(service, project, functions):
             raise ValueError('无法确认 Python 源码逻辑行：' + file) from exc
 
     def content(key):
-        identity = symbol_identity(key)
+        identity = index_identity(key)
         if identity not in contents:
             contents[identity] = graph.content(root, node=key)
         return contents[identity]
 
     def owning_unit(node):
-        identity = symbol_identity(node)
+        identity = index_identity(node)
         if identity not in owners:
             owners[identity] = graph.location(root, node).get('container') or node
         return owners[identity]
@@ -64,14 +64,14 @@ def extract_source(service, project, functions):
             file_dependencies[file] = {row['filePath'] for row in response.get('dependencies', [])}
         return file_dependencies[file]
 
-    entries = _resolve_entries(functions, nodes, language, owning_unit, content)
+    entries = _resolve_entries(functions, nodes, owning_unit)
     pending, visited = deque((selector, True) for selector in entries), set()
     result = {'entry_units': [], 'dependencies': {'project': [], 'external': []}}
     entry_ranges, dependency_ranges = {}, {}
     # 队列中的每项都是已确认的源码单元。文件查询只提供候选，不直接扩大交付范围。
     while pending:
         selector, entry = pending.popleft()
-        identity = symbol_identity(selector)
+        identity = index_identity(selector)
         if identity in visited:
             continue
         visited.add(identity)
@@ -102,17 +102,22 @@ def extract_source(service, project, functions):
                 if body_start < 0:
                     body_start = clean_body.find('=>')
             # 抽象方法只有声明。声明中的方法名不能充当调用另一实现的证据。
-            calls = set(re.findall(r'\b([A-Za-z_]\w*)\s*\(', clean_body[body_start + 1:])) if body_start >= 0 else set()
             if body_start >= 0:
                 function_references.update(referenced_names(clean_body[body_start + 1:], language))
-            for target in graph.callees(root, member)['functions']:
-                if target['name'] in calls:
-                    candidates[symbol_identity(target)] = target
+            response = graph.callees(root, member)
+            for field in ('functions', 'decorators', 'instantiates'):
+                for target in response[field]:
+                    candidates[index_identity(target)] = target
         if unit['node']['kind'] in {'class', 'struct', 'interface'}:
-            dependencies = graph.call('getDependencies', root, level='class', input=graph.key(selector))
-            for target in dependencies.get('dependencies', []):
+            context = graph.type_context(root, selector)
+            for field in ('bases', 'initializers', 'bindings'):
+                for relation in context[field]:
+                    target = relation['key']
+                    candidates[index_identity(target)] = target
+            dependencies = graph.call('getDependencies', root, level='class', input=index_key(selector))
+            for target in dependencies['dependencies']:
                 if target['name'] in identifiers:
-                    candidates[symbol_identity(target)] = target
+                    candidates[index_identity(target)] = target
 
         if language == 'Python':
             file_candidates, file_ranges, external = collect_python_dependencies(
@@ -120,7 +125,7 @@ def extract_source(service, project, functions):
         else:
             file_candidates, file_ranges, external = collect_file_dependencies(
                 spans, selector['name'], language, project_files, nodes, identifiers, function_references,
-                source=source, content=content, owning_unit=owning_unit, dependency_files=dependency_files,
+                source=source, owning_unit=owning_unit, dependency_files=dependency_files,
             )
         candidates.update(file_candidates)
         dependency_ranges.update(file_ranges)
@@ -128,7 +133,7 @@ def extract_source(service, project, functions):
         for target in candidates.values():
             node = content(target)['node']
             if node['kind'] in {'function', 'method', 'constructor'}:
-                target = owning_unit(node)
+                target = owning_unit(index_key(target))
             pending.append((target, False))
 
     # 多个入口和依赖可能覆盖同一单元，入口优先，范围按原始坐标去重。
@@ -146,26 +151,16 @@ def extract_source(service, project, functions):
     return result
 
 
-def _resolve_entries(functions, nodes, language, owning_unit, content):
-    """匹配入口三元key，归并属于同一源码单元的候选。"""
+def _resolve_entries(functions, nodes, owning_unit):
+    """公开输入用三元键定位，索引查询沿用上游的完整定位键。"""
     entries = []
     for function in functions:
-        name = function['name']
         candidates = [node for node in nodes if symbol_identity(function) == symbol_identity(node)]
         if not candidates:
-            raise ValueError('未找到入口函数：' + name)
-        groups = {}
-        for node in candidates:
-            selector = owning_unit(node)
-            unit = content(selector)
-            partial = language == 'C#' and re.search(
-                r'\bpartial\s+(?:class|struct|interface)\s+' + re.escape(selector['name']) + r'\b', unit['source'])
-            identity = ((selector['name'], unit['source']) if partial
-                        else symbol_identity(selector))
-            groups.setdefault(identity, []).append(selector)
-        if len(groups) != 1:
-            raise ValueError('入口函数存在歧义：' + name)
-        entries.extend(next(iter(groups.values())))
+            raise ValueError('未找到入口函数：' + repr(function))
+        if len(candidates) != 1:
+            raise ValueError('入口函数三元定位键存在歧义：' + repr(function))
+        entries.append(owning_unit(candidates[0]))
     return entries
 
 

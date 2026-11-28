@@ -49,6 +49,10 @@ def plan_tests(analysis):
     cases = [row['case'] for row in analysis['cases']]
     files = [name for name, record in analysis['files'].items() if 'source' in record]
     payload = {'language': analysis['language'], 'cases': cases, 'files': prompt_files(analysis, files)}
+    labels = [{'case': row['case'], 'testIdentity': row['testIdentity']}
+              for row in analysis['cases'] if row.get('testIdentity')]
+    if labels:
+        payload['test_identities'] = labels
     messages = build_messages(PURE_PLAN_PROMPT, payload)
     try:
         response = llm._call_model(messages)

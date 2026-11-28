@@ -2,8 +2,9 @@
 
 from collections import defaultdict, deque
 
-from localization.codegraph import rebase_key, request_scope, symbol_identity, symbol_key
-from localization.config import public_directories, SDK_LANGUAGES
+from localization.codegraph import index_identity, index_key, request_scope, symbol_identity, symbol_key
+from localization.config import SDK_LANGUAGES
+from localization.public_test_analysis import indexed_test_key
 
 
 @request_scope
@@ -12,22 +13,20 @@ def find_target_dependencies(graph, language, original_tests, project, cases, te
     graph.prepare(project, SDK_LANGUAGES[language])
     test_files = {path.relative_to(project).as_posix() for path in test_paths}
     nodes = defaultdict(list)
-    functions = graph.call("getAllFunctions", project)
-    if not isinstance(functions, list):
-        raise ValueError("目标函数清单不是列表")
-    for row in functions:
-        key = symbol_key(row)
-        if key["filePath"] in test_files:
-            nodes[key["filePath"], key["name"]].append(key)
+    for row in graph.function_keys(project):
+        if row["filePath"] in test_files:
+            nodes[row["filePath"], row["name"]].append(row)
 
     dependencies = []
     for case in cases:
         candidates = nodes[case["filePath"], case["name"]]
+        if language == "C++" or len(candidates) > 1:
+            origin, original_key = indexed_test_key(graph, original_tests, case)
+        if language == "C++":
+            identity = original_key["testIdentity"]
+            candidates = [row for row in candidates if row.get("testIdentity") == identity]
         if len(candidates) > 1:
-            # 组装可能改变行号。同文件同名时按原始声明内容区分。
-            origin = next(root for root in public_directories(original_tests)
-                          if (original_tests / case["filePath"]).is_relative_to(root))
-            original_key = rebase_key(case, original_tests, origin)
+            # 组装可能改变行号，保留真实原文和作用域能确认的候选。
             original_source = graph.content(origin, node=original_key)["source"].strip()
             candidates = [key for key in candidates
                           if graph.content(project, node=key)["source"].strip() == original_source]
@@ -47,7 +46,7 @@ def find_target_dependencies(graph, language, original_tests, project, cases, te
         queue = deque(candidates)
         while queue:
             key = queue.popleft()
-            identity = symbol_identity(key)
+            identity = index_identity(key)
             if identity in visited:
                 continue
             visited.add(identity)
@@ -56,12 +55,15 @@ def find_target_dependencies(graph, language, original_tests, project, cases, te
             if not isinstance(calls, list):
                 raise ValueError(f"目标调用关系不是列表：{key}")
             for call in calls:
-                callee = symbol_key(call)
+                callee = index_key(call)
                 path = callee["filePath"]
                 if path in business_files:
-                    confirmed[symbol_identity(callee)] = callee
+                    confirmed[index_identity(callee)] = callee
                 elif path in test_files:
                     queue.append(callee)
         # 上游仅提供已解析的边，空列表表示未确认到已有目标依赖。
-        dependencies.append({"case": case, "dependencies": list(confirmed.values())})
+        public_keys = {symbol_identity(key): symbol_key(key) for key in confirmed.values()}
+        if len(public_keys) != len(confirmed):
+            raise ValueError(f"目标依赖三元定位键存在歧义：{case}")
+        dependencies.append({"case": case, "dependencies": list(public_keys.values())})
     return dependencies
