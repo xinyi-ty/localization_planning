@@ -1,64 +1,25 @@
-"""把仓库定位结果按批交给翻译主流程。"""
+"""准备全仓分批和组装结果，按需定位当前批源码。"""
 
-from pathlib import Path
-
-from localization import Localization
-from localization.config import pair_name, public_directories, repository
+from localization.config import public_directories
 
 
-def localize_repository(config, translation_pair, repository_name, output_dir, *, through_batch=None):
-    """组装各批测试并定位需要翻译的源码。
-
-    使用 config 中的原始数据集，累计测试文件写入 output_dir。
-    through_batch 指定本次交付的最后一批。分批接口仍规划全部公测。
-    返回以整数为批次键的结果，以及解释相对源码路径所需的源工程根目录。
-    单批缺少映射或入口范围时，抛出带仓库名和批次号的异常。
-    """
-    pair = pair_name(translation_pair)
-    source_language, target_language = pair.split("_to_")
-    # 实例必须绑定当前请求的翻译对。复制配置项，便于调用方用同一份配置处理其他仓库。
-    dataset = {**config["dataset"], "source_lang": source_language, "target_lang": target_language}
-    dataset_root = Path(dataset["path"]).expanduser().resolve()
-    repo = repository(dataset_root, pair, repository_name)
-    output = Path(output_dir).expanduser().resolve()
-    # 组装先于映射。将生成文件放在原仓库外，避免后续索引读到组装产物。
-    if output.is_relative_to(repo):
+def localize_repository(locator, pair, repository_name, repository, output):
+    """分批和组装只执行一次，返回每批新增用例和组装文件。"""
+    if output.is_relative_to(repository):
         raise ValueError("组装输出目录须位于数据集原仓库之外")
-    test_dirs = public_directories(repo / "target_project")
-
-    # 同一实例复用该仓库的公测分析和源工程索引。
-    locator = Localization({**config, "dataset": dataset})
     plan = locator.plan_tests(pair, repository_name)
-    # 组装用完整计划校验未来用例，映射和源码获取只处理本次交付的批次。
-    if through_batch is None:
-        test_files = locator.assemble_tests(plan, test_dirs, output_dir=output)
-        selected = plan
-    else:
-        test_files = locator.assemble_tests(plan, test_dirs, output_dir=output, through_batch=through_batch)
-        selected = {number: cases for number, cases in plan.items() if number <= through_batch}
-    matches = locator.map_tests(repository_name, selected)
+    files = locator.assemble_tests(plan, public_directories(repository / "target_project"),
+                                   output_dir=output)
+    return {number: {"new_cases": cases, "test_files": files[number]}
+            for number, cases in plan.items()}
 
-    batches = {}
-    for number, new_cases in selected.items():
-        functions = matches[number]
-        if not functions:
-            raise ValueError(f"{repository_name} 第 {number} 批映射未返回源函数")
-        # 映射结果已是源码获取接口接受的三元 key，保留路径和行号以区分同名函数。
-        ranges = locator.extract_source(repository_name, functions)
-        # 源码获取接口已记录具体失败原因，并以空字典表示这类失败。
-        if not ranges.get("entry_units"):
-            raise ValueError(f"{repository_name} 第 {number} 批源码获取未返回入口范围")
-        batches[number] = {
-            "new_cases": new_cases,
-            "test_files": test_files[number],
-            "source_functions": functions,
-            "source_ranges": ranges,
-        }
 
-    # 下游通过 source_root 和各区间的 filePath 读取对应的原语言源码。
-    return {
-        "translation_pair": pair,
-        "repository": repository_name,
-        "source_root": str((repo / "source_project").resolve()),
-        "batches": batches,
-    }
+def localize_batch(locator, repository_name, number, cases):
+    """仅在当前批开始时映射用例并获取源语言入口和依赖。"""
+    functions = locator.map_tests(repository_name, {number: cases})[number]
+    if not functions:
+        raise ValueError(f"{repository_name} 第 {number} 批映射未返回源函数")
+    ranges = locator.extract_source(repository_name, functions)
+    if not ranges.get("entry_units"):
+        raise ValueError(f"{repository_name} 第 {number} 批源码获取未返回入口范围")
+    return {"source_functions": functions, "source_ranges": ranges}

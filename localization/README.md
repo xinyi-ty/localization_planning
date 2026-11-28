@@ -46,7 +46,7 @@ codegraph:
   timeout_seconds: 120
 ```
 
-正式入口读取仓库、翻译对和运行目录。分批覆盖全部公测，组装、映射、源码获取、翻译和 Docker 公测只执行首批。相对输出路径以启动目录为基准，运行目录须尚未存在
+正式入口读取仓库、翻译对和运行目录。先完成全仓分批和公测组装，再按批次做映射、源码获取、翻译和累计公测。相对输出路径以启动目录为基准，运行目录须尚未存在
 
 在项目根目录启动，运行前确认模型服务、CodeGraph 和 Docker 可用
 
@@ -54,7 +54,7 @@ codegraph:
 .venv/bin/python -m translation.main
 ```
 
-首批项目构建配置保存在 `translation/system_prompt.py`。Python 目标工程会生成 `requirements.txt`，声明测试依赖。程序把实际使用的配置写入目标工程，并将同一份原文放入翻译系统提示词。仓库需要额外依赖或特定构建参数时，可在 `default.yaml` 中通过 `test_config_path` 指向自行编写的配置
+项目构建配置保存在 `translation/system_prompt.py`。Python 目标工程会生成 `requirements.txt`，声明测试依赖。程序把实际使用的配置写入目标工程，并将同一份原文放入翻译系统提示词。仓库需要额外依赖或特定构建参数时，可在 `default.yaml` 中通过 `test_config_path` 指向自行编写的配置
 
 首次部署或修改工具链后，在项目根目录构建统一的本地测试镜像
 
@@ -64,7 +64,7 @@ bash docker/build_image.sh
 
 `docker/Dockerfile` 在同一个镜像中安装五种目标语言的测试工具链，并在构建时检查工具版本。Dockerfile 直接安装 pytest，构建和测试使用固定的 `localization-test:latest` 标签。测试时复用镜像，容器退出后自动删除
 
-运行结果写到 `workspace/<翻译对>/<仓库>/target_project/`，首批请求、模型回复、测试日志和摘要写到 `logs/<翻译对>/<仓库>/batch_001/`。失败时命令返回非零并保留已产生的文件
+通过累计公测的目标工程发布到 `workspace/<翻译对>/<仓库>/target_project/`。第 2 批起，模型接收相关已有目标文件原文和已确认的目标侧调用依赖。翻译范围覆盖公测直接要求的行为及必要依赖。每批请求、模型回复、公测报告和摘要写到 `logs/<翻译对>/<仓库>/batch_NNN/`，仓库摘要位于日志的仓库目录。失败时命令返回非零，保留已通过的正式工程和已生成的失败候选
 
 ### 功能调用
 
@@ -322,33 +322,6 @@ Localization.extract_source(...)
 ```
 
 本地通过上游HTTP读取节点、所属类、源码及直接依赖，普通源码单元使用节点坐标，C# partial和C++类外实现按getContent合并原文恢复各片段位置。候选文件中的定义只有获得当前源码单元的引用证据才继续提取，注释、字符串和抽象方法声明不作为调用证据。依赖完整性取决于上游索引覆盖，合并片段无法唯一定位时记录失败并返回空字典
-
-## 启动首批冒烟测试
-
-冒烟测试对一个样例仓库生成全部测试批次，再执行首批组装、映射、源码获取、翻译和运行公测
-
-1. 按上文完成虚拟环境、`default.yaml` 和 `.env` 配置。在一个终端启动上游 CodeGraph。若服务已在 `codegraph.base_url` 指定的地址运行，直接执行下一步
-
-   ```bash
-   cd /home/srp/SRP/localization_planning/codegraph_api
-   node --version
-   npm start
-   ```
-
-   上游使用 Node.js 24。默认监听 `http://127.0.0.1:3000`，需与 `default.yaml` 中的服务地址一致
-
-2. 在另一个终端回到项目根目录，运行指定翻译对的样例
-
-   ```bash
-   cd /home/srp/SRP/localization_planning
-   .venv/bin/python -B -m translation.smoke.run --pair 'C#_to_Java'
-   ```
-
-   每次命令接收一个 `--pair`。运行 `.venv/bin/python -B -m translation.smoke.run --help` 可查看七个可选翻译对。仓库名和目标源码路径由 `translation/smoke/run.py` 的 `SAMPLES` 指定。换仓库时，更新对应翻译对的仓库名与目标源码路径，并确认数据集存在该仓库
-
-   测试工具按目标语言选择。Python 使用虚拟环境中的 pytest，Java 需要 JDK 和 Maven，C# 需要 .NET 8 SDK，C++ 需要编译器、CMake 和 GoogleTest，Rust 需要 Cargo 和 Rust 工具链
-
-结果默认写入 `translation/smoke/output/<运行时间>/`，终端会打印本次样例目录。查看 `summary.json` 确认结果，在翻译对子目录的 `target_project/` 查看翻译代码和组装后的测试文件，在 `tests.log` 查看编译与测试输出。分批、组装清单、映射和源码范围会按执行进度保存为 JSON
 
 ## 文件结构
 

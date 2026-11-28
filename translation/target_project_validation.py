@@ -79,23 +79,6 @@ def expected_tests(language, cases, original_tests):
     return expected
 
 
-def docker_command(image, project, log, stage, *arguments):
-    """把目标工程挂载到临时容器并记录工具的退出原因。"""
-    command = ["docker", "run", "--rm", "--pull", "never",
-               "--mount", f"type=bind,source={project},target=/workspace",
-               "--workdir", "/workspace", image, *arguments]
-    with log.open("a", encoding="utf-8") as stream:
-        stream.write(f"\n[{stage}] $ {shlex.join(command)}\n")
-        stream.flush()
-        try:
-            subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, timeout=240, check=True)
-        except subprocess.CalledProcessError as exc:
-            category = "测试环境" if exc.returncode in {125, 126, 127} else stage
-            raise RuntimeError(f"{category}失败，退出码 {exc.returncode}，详见 {log}") from exc
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise RuntimeError(f"{stage}未完成：{exc}，详见 {log}") from exc
-
-
 def normalized_name(name):
     """去掉报告中的参数文本或参数实例编号。"""
     return re.split(r"[\[(]", name, maxsplit=1)[0].strip()
@@ -135,39 +118,38 @@ def xml_results(language, reports, project):
 
 
 def run_target_tests(language, cases, original_tests, project, logs):
-    """在 Docker 中编译、运行并核对首批用例，返回执行结果。"""
+    """在统一镜像运行本批累计公测，并按原用例身份核对报告。"""
     expected = expected_tests(language, cases, original_tests)
-    image = "localization-test:latest"
+    script = Path(__file__).resolve().parents[1] / "docker" / "run_tests.sh"
     log = logs / "tests.log"
     case_files = sorted({case["filePath"] for case in cases})
-
-    def run(stage, *arguments):
-        docker_command(image, project, log, stage, *arguments)
+    command = [
+        "docker", "run", "--rm", "--pull", "never",
+        "--mount", f"type=bind,source={project},target=/target_project,readonly",
+        "--mount", f"type=bind,source={logs},target=/test_logs",
+        "--mount", f"type=bind,source={script},target=/run_tests.sh,readonly",
+        "--workdir", "/workspace", "localization-test:latest",
+        "bash", "/run_tests.sh", language, *case_files,
+    ]
+    with log.open("w", encoding="utf-8") as stream:
+        stream.write(f"$ {shlex.join(command)}\n")
+        stream.flush()
+        try:
+            subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, timeout=240, check=True)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"容器公测命令失败，退出码 {exc.returncode}，详见 {log}") from exc
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"容器公测未完成，详见 {log}") from exc
 
     if language == "Python":
-        command = ("python", "-B", "-m", "pytest")
-        run("公测收集", *command, "--collect-only", *case_files)
-        run("公测执行", *command, "-o", "junit_family=xunit1", "--junitxml=.public-results.xml", *case_files)
-        reports = [project / ".public-results.xml"]
+        reports = [logs / ".public-results.xml"]
     elif language == "Java":
-        run("编译", "mvn", "-B", "-ntp", "test-compile")
-        run("公测执行", "mvn", "-B", "-ntp", "surefire:test")
-        reports = sorted((project / "target/surefire-reports").glob("TEST-*.xml"))
+        reports = sorted((logs / "target/surefire-reports").glob("TEST-*.xml"))
     elif language == "C#":
-        config_filename, _ = BUILD_CONFIGS[language]
-        run("编译", "dotnet", "build", config_filename)
-        run("公测执行", "dotnet", "test", config_filename, "--no-build",
-            "--logger", "trx;LogFileName=results.trx", "--results-directory", ".public-results")
-        reports = [project / ".public-results/results.trx"]
+        reports = [logs / ".public-results/results.trx"]
     elif language == "C++":
-        run("构建配置", "cmake", "-S", ".", "-B", "build")
-        run("编译", "cmake", "--build", "build", "--parallel", "2")
-        run("公测执行", "ctest", "--test-dir", "build", "--output-on-failure")
-        reports = [project / "build/results.xml"]
+        reports = [logs / "build/results.xml"]
     else:
-        command = ("cargo", "test", "--offline", "--test", "public_batch")
-        run("编译", *command, "--no-run")
-        run("公测执行", *command, "--", "--test-threads=1")
         output = log.read_text(encoding="utf-8", errors="replace")
         results = [
             ((name.split("::", 1)[0], name.rsplit("::", 1)[-1]), status == "ok")

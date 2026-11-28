@@ -10,8 +10,8 @@ from .public_test_analysis import reference_identity
 logger = logging.getLogger(__name__)
 
 
-def ordered_batches(batches):
-    """将 JSON 批次键转换为整数，校验编号从 1 连续递增。"""
+def ordered_batches(batches, *, require_contiguous):
+    """统一批次键，完整计划要求编号从 1 连续递增。"""
     if not isinstance(batches, dict) or not batches:
         raise ValueError('批次计划须为非空字典')
     result = {}
@@ -21,13 +21,13 @@ def ordered_batches(batches):
         if type(index) is not int or index < 1 or index in result or not isinstance(refs, list) or not refs:
             raise ValueError('批次编号须为不重复正整数，每批须有用例')
         result[index] = refs
-    if sorted(result) != list(range(1, len(result) + 1)):
+    if require_contiguous and sorted(result) != list(range(1, len(result) + 1)):
         raise ValueError('批次编号须从1连续递增')
     return dict(sorted(result.items()))
 
 
 def _validate_batches(batches, cases, *, require_all):
-    batches = ordered_batches(batches)
+    batches = ordered_batches(batches, require_contiguous=require_all)
     known = {reference_identity(case) for case in cases}
     selected = [reference_identity(ref) for refs in batches.values() for ref in refs]
     if len(selected) != len(set(selected)) or not set(selected) <= known:
