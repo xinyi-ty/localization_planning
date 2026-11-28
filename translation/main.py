@@ -9,6 +9,7 @@ import shutil
 from localization import Localization
 from localization.codegraph import symbol_identity
 from localization.config import load_config, pair_name, repository
+from localization.llm import load_model_settings
 
 from .localization_step import localize_batch, localize_repository
 from .target_dependencies import find_target_dependencies
@@ -45,29 +46,43 @@ def run_repository(config):
         dataset = config["dataset"]
         repo_name = dataset["repository"]
         pair = pair_name(f"{dataset['source_lang']}_to_{dataset['target_lang']}")
-        repo = repository(Path(dataset["path"]).expanduser().resolve(), pair, repo_name)
-        root = Path(config["output_dir"]).expanduser().resolve()
-        if root.is_relative_to(repo):
-            raise ValueError("运行输出须位于数据集原仓库之外")
+        dataset_root = Path(dataset["path"]).expanduser().resolve()
+        repo = repository(dataset_root, pair, repo_name)
+        model = Path(load_model_settings()["model"].strip()).name
+        if not model or model == "..":
+            raise ValueError("LLM_MODEL缺少可用的模型目录名")
+        root = (Path(config["output_dir"]).expanduser() / model).resolve()
+        workspace = root / "workspace"
+        work_repo = workspace / pair / repo_name
+        log_dir = root / "logs" / pair / repo_name
+        if any(path.resolve().is_relative_to(dataset_root) for path in (root, work_repo, log_dir)):
+            raise ValueError("运行目录须位于数据集之外")
 
         phase = "初始化运行目录"
-        root.mkdir(parents=True, exist_ok=False)
-        project = root / "workspace" / pair / repo_name / "target_project"
-        logs = root / "logs" / pair / repo_name
-        logs.mkdir(parents=True)
-        project.parent.mkdir(parents=True)
+        work_repo.mkdir(parents=True)
+        log_dir.mkdir(parents=True)
+        logs = log_dir
+        project = work_repo / "target_project"
         summary.update(repository=repo_name, translation_pair=pair, target_project=str(project))
 
         # 部分定位接口用空结果报告失败，保留接口本身写出的诊断。
         graph_log = logging.FileHandler(logs / "localization.log", encoding="utf-8")
         logging.getLogger("localization").addHandler(graph_log)
-        locator = Localization(config)
-        source_root = (repo / "source_project").resolve(strict=True)
-        original_tests = (repo / "target_project").resolve(strict=True)
+
+        phase = "复制仓库到工作区"
+        source_root = work_repo / "source_project"
+        # 原公测供每批查询，已通过的目标工程单独发布。
+        target_directory = "input/target_project"
+        original_tests = work_repo / target_directory
+        ignore_index = shutil.ignore_patterns(".codegraph")
+        shutil.copytree(repo / "source_project", source_root, ignore=ignore_index)
+        shutil.copytree(repo / "target_project", original_tests, ignore=ignore_index)
+        locator = Localization({**config, "dataset": {**dataset, "path": str(workspace)}},
+                               target_directory=target_directory)
         assembly = logs / "assembly"
 
         phase = "分批和组装"
-        batches = localize_repository(locator, pair, repo_name, repo, assembly)
+        batches = localize_repository(locator, pair, repo_name, original_tests, assembly)
         summary["batches"] = dict.fromkeys(batches, "not_run")
         write_summary(logs / "summary.json", summary)
         cumulative_cases, business_files, implemented = [], set(), set()

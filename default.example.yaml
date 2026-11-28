@@ -3,7 +3,7 @@ dataset:
   source_lang: Java
   target_lang: Python
   repository: ""
-output_dir: translation/output/rounds
+output_dir: results
 # 可按仓库提供自行编写的完整构建配置，例如声明目标依赖或 Rust crate 名。
 # test_config_path: /path/to/target-build-config
 codegraph:

@@ -40,13 +40,13 @@ dataset:
   source_lang: Java
   target_lang: Python
   repository: aventrix_jnanoid
-output_dir: translation/output/rounds
+output_dir: results
 codegraph:
   base_url: http://127.0.0.1:3000
   timeout_seconds: 120
 ```
 
-正式入口读取仓库、翻译对和运行目录。先完成全仓分批和公测组装，再按批次做映射、源码获取、翻译和累计公测。相对输出路径以启动目录为基准，运行目录须尚未存在
+正式入口先将选中仓库的源工程和目标公测工程复制到工作区，跳过已有的 `.codegraph`。分批、组装、映射和源码获取均使用工作区内的副本，再逐批翻译并验证累计公测。相对结果路径以启动目录为基准，同一模型下的本次仓库工作目录须尚未存在
 
 在项目根目录启动，运行前确认模型服务、CodeGraph 和 Docker 可用
 
@@ -64,7 +64,7 @@ bash docker/build_image.sh
 
 `docker/Dockerfile` 在同一个镜像中安装五种目标语言的测试工具链，并在构建时检查工具版本。Dockerfile 直接安装 pytest，构建和测试使用固定的 `localization-test:latest` 标签。测试时复用镜像，容器退出后自动删除
 
-通过累计公测的目标工程发布到 `workspace/<翻译对>/<仓库>/target_project/`。第 2 批起，模型接收相关已有目标文件原文和已确认的目标侧调用依赖。翻译范围覆盖公测直接要求的行为及必要依赖。每批请求、模型回复、公测报告和摘要写到 `logs/<翻译对>/<仓库>/batch_NNN/`，仓库摘要位于日志的仓库目录。失败时命令返回非零，保留已通过的正式工程和已生成的失败候选
+结果默认写到 `results/<模型名>/`，模型名取自 `LLM_MODEL`。仓库工作目录为 `workspace/<翻译对>/<仓库>/`，其中 `source_project/` 保存源工程副本，`input/target_project/` 保存原公测工程副本，`target_project/` 保存通过累计公测的目标工程。第 2 批起，模型接收相关已有目标文件原文和已确认的目标侧调用依赖。翻译范围覆盖公测直接要求的行为及必要依赖。每批请求、模型回复、公测报告和摘要写到 `logs/<翻译对>/<仓库>/batch_NNN/`，仓库摘要位于日志的仓库目录。失败时命令返回非零，保留已通过的正式工程和已生成的失败候选
 
 ### 功能调用
 

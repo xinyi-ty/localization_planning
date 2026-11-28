@@ -16,11 +16,12 @@ from .public_test_plan import plan_tests
 class Localization:
     """绑定翻译对和上游客户端，提供规划、组装、映射与源码提取入口。"""
 
-    def __init__(self, config):
+    def __init__(self, config, *, target_directory="target_project"):
         self.config = deepcopy(config)
         data = self.config["dataset"]
         # 相对数据集路径以进程启动目录为基准。服务器配置使用绝对路径。
         self.root = Path(data["path"]).expanduser().resolve()
+        self._target_directory = target_directory
         self.source, self.target = language(data["source_lang"]), language(data["target_lang"])
         self.pair = pair_name(self.source + "_to_" + self.target)
         self.graph = CodeGraph(self.config["codegraph"])
@@ -31,7 +32,7 @@ class Localization:
         if fresh or self._current_project is None or self._current_project['name'] != name:
             repo = repository(self.root, self.pair, name)
             source = (repo / 'source_project').resolve(strict=True)
-            target = (repo / 'target_project').resolve(strict=True)
+            target = (repo / self._target_directory).resolve(strict=True)
             if any(not path.is_dir() or not path.is_relative_to(repo) for path in (source, target)):
                 raise ValueError('工程目录不存在或越界')
             self._current_project = {'name': name, 'repo': repo, 'source_root': source,

@@ -3,12 +3,12 @@
 from localization.config import public_directories
 
 
-def localize_repository(locator, pair, repository_name, repository, output):
+def localize_repository(locator, pair, repository_name, original_tests, output):
     """分批和组装只执行一次，返回每批新增用例和组装文件。"""
-    if output.is_relative_to(repository):
-        raise ValueError("组装输出目录须位于数据集原仓库之外")
+    if output.is_relative_to(original_tests):
+        raise ValueError("组装输出目录须位于原公测工程之外")
     plan = locator.plan_tests(pair, repository_name)
-    files = locator.assemble_tests(plan, public_directories(repository / "target_project"),
+    files = locator.assemble_tests(plan, public_directories(original_tests),
                                    output_dir=output)
     return {number: {"new_cases": cases, "test_files": files[number]}
             for number, cases in plan.items()}
