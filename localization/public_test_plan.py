@@ -37,13 +37,15 @@ def _validate_batches(batches, cases, *, require_all):
     return batches
 
 
-def finalize_batches(batches, analysis, *, require_all=False):
+def finalize_batches(
+    batches: dict[int | str, list[dict]], analysis: dict, *, require_all: bool = False,
+) -> dict[int, list[dict]]:
     """校验调用方批次，组装要求完整覆盖，映射可处理其中一部分。"""
     return deepcopy(_validate_batches(batches, (row['case'] for row in analysis['cases']),
                                       require_all=require_all))
 
 
-def plan_tests(analysis):
+def plan_tests(analysis: dict) -> dict[int, list[dict]]:
     """纯模型分批只读取基本用例清单和原文，按通用覆盖规则验收。"""
     check_snapshot(analysis['snapshot'])
     cases = [row['case'] for row in analysis['cases']]
@@ -57,7 +59,7 @@ def plan_tests(analysis):
     try:
         response = llm._call_model(messages)
         result = _validate_batches(llm.json_response(response), cases, require_all=True)
-    except (ValueError, TypeError, OSError) as exc:
+    except (ValueError, OSError) as exc:
         logger.error('纯LLM分批失败：%s', exc)
         raise
     check_snapshot(analysis['snapshot'])

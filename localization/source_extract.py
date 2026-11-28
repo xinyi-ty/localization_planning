@@ -1,17 +1,63 @@
 """源码获取接口的入口定位、依赖遍历与原文范围整理。"""
 from collections import deque
-from functools import cache
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from os.path import commonprefix
 from pathlib import Path
 import re
 import tokenize
+from typing import TYPE_CHECKING
 
 from .config import SDK_LANGUAGES, files_under
-from .codegraph import index_identity, index_key, symbol_identity
+from .codegraph import CodeGraph, IndexIdentity, index_identity, index_key, symbol_identity
 from .file_context import create_snapshot, check_snapshot, python_statements, code_text
 from .source_dependencies import collect_file_dependencies, collect_python_dependencies
 
-def analyze_source(root, language, graph):
+if TYPE_CHECKING:
+    from .api import Localization
+
+
+@dataclass
+class _SourceLookup:
+    """在一次提取内共用源码和位置查询，保留用于一致性检查的原文。"""
+
+    root: Path
+    graph: CodeGraph
+    contents: dict[IndexIdentity, dict]
+    sources: dict[str, str] = field(default_factory=dict)
+    python_lines: dict[str, list[list[tokenize.TokenInfo]]] = field(default_factory=dict)
+
+    def source(self, file: str) -> str:
+        if file not in self.sources:
+            self.sources[file] = checked_file(self.graph, self.root, file)
+        return self.sources[file]
+
+    def statements(self, file: str) -> list[list[tokenize.TokenInfo]]:
+        if file not in self.python_lines:
+            source = self.source(file)
+            try:
+                self.python_lines[file] = python_statements(source)
+            except (tokenize.TokenError, IndentationError) as exc:
+                raise ValueError('无法确认 Python 源码逻辑行：' + file) from exc
+        return self.python_lines[file]
+
+    def content(self, key: dict) -> dict:
+        identity = index_identity(key)
+        if identity not in self.contents:
+            self.contents[identity] = self.graph.content(self.root, node=key)
+        return self.contents[identity]
+
+    def owning_unit(self, node: dict) -> dict:
+        return self.graph.location(self.root, node).get('container') or node
+
+    def dependency_files(self, file: str) -> set[str]:
+        response = self.graph.call(
+            'getDependencies', self.root, level='file', input={'kind': 'file', 'filePath': file},
+        )
+        return {row['filePath'] for row in response.get('dependencies', [])}
+
+
+def analyze_source(root: Path, language: str, graph: CodeGraph) -> dict:
     """供映射与提取复用的源函数记录，每条同时保留key、原文和原生节点。"""
     snapshot = create_snapshot(root, [root])
     graph.prepare(root, SDK_LANGUAGES[language])
@@ -23,48 +69,18 @@ def analyze_source(root, language, graph):
     return {'root': str(root), 'language': language, 'functions': functions, 'snapshot': snapshot}
 
 
-def extract_source(service, project, functions):
+def extract_source(service: "Localization", project: dict, functions: list[dict]) -> dict:
     """按函数 key 定位入口单元，并汇总源码范围和外部导入依赖。"""
     inventory = service._source_analysis(project)
     root = Path(inventory['root'])
     graph, language = service.graph, service.source
     nodes = [row['node'] for row in inventory['functions']]
-    sources, contents, owners, file_dependencies = {}, {}, {}, {}
-    contents.update({index_identity(row['key']): {'node': row['node'], 'source': row['source']}
-                     for row in inventory['functions']})
+    lookup = _SourceLookup(root, graph, {
+        index_identity(row['key']): {'node': row['node'], 'source': row['source']}
+        for row in inventory['functions']
+    })
     project_files = [p.relative_to(root).as_posix() for p in files_under(root)]
-
-    def source(file):
-        if file not in sources:
-            sources[file] = checked_file(graph, root, file)
-        return sources[file]
-
-    @cache
-    def statements(file):
-        try:
-            return python_statements(source(file))
-        except (tokenize.TokenError, IndentationError) as exc:
-            raise ValueError('无法确认 Python 源码逻辑行：' + file) from exc
-
-    def content(key):
-        identity = index_identity(key)
-        if identity not in contents:
-            contents[identity] = graph.content(root, node=key)
-        return contents[identity]
-
-    def owning_unit(node):
-        identity = index_identity(node)
-        if identity not in owners:
-            owners[identity] = graph.location(root, node).get('container') or node
-        return owners[identity]
-
-    def dependency_files(file):
-        if file not in file_dependencies:
-            response = graph.call('getDependencies', root, level='file', input={'kind': 'file', 'filePath': file})
-            file_dependencies[file] = {row['filePath'] for row in response.get('dependencies', [])}
-        return file_dependencies[file]
-
-    entries = _resolve_entries(functions, nodes, owning_unit)
+    entries = _resolve_entries(functions, nodes, lookup.owning_unit)
     pending, visited = deque((selector, True) for selector in entries), set()
     result = {'entry_units': [], 'dependencies': {'project': [], 'external': []}}
     entry_ranges, dependency_ranges = {}, {}
@@ -75,65 +91,36 @@ def extract_source(service, project, functions):
         if identity in visited:
             continue
         visited.add(identity)
-        unit = content(selector)
-        spans = source_ranges(unit, source, project_files, language, root)
+        unit = lookup.content(selector)
+        spans = source_ranges(unit, lookup.source, project_files, language, root)
         if language == 'Python':
             for span in spans:
                 span['startLine'] = _python_declaration_start(
-                    statements(span['filePath']), span['startLine'])
+                    lookup.statements(span['filePath']), span['startLine'])
         destination = entry_ranges if entry else dependency_ranges
         for span in spans:
             key = (span['filePath'], span['startLine'], span['endLine'])
             destination[key] = span
-        text = unit['source']
-        identifiers = referenced_names(text, language)
-        candidates = {}
-        members = [node for node in nodes if any(
-            node['filePath'] == span['filePath'] and span['startLine'] <= node['startLine'] <= span['endLine']
-            for span in spans)]
-        function_references = set()
-        for member in members:
-            body = content(member)['source']
-            clean_body = code_text(body, language)
-            if language == 'Python':
-                body_start = clean_body.find(':')
-            else:
-                body_start = clean_body.find('{')
-                if body_start < 0:
-                    body_start = clean_body.find('=>')
-            # 抽象方法只有声明。声明中的方法名不能充当调用另一实现的证据。
-            if body_start >= 0:
-                function_references.update(referenced_names(clean_body[body_start + 1:], language))
-            response = graph.callees(root, member)
-            for field in ('functions', 'decorators', 'instantiates'):
-                for target in response[field]:
-                    candidates[index_identity(target)] = target
-        if unit['node']['kind'] in {'class', 'struct', 'interface'}:
-            context = graph.type_context(root, selector)
-            for field in ('bases', 'initializers', 'bindings'):
-                for relation in context[field]:
-                    target = relation['key']
-                    candidates[index_identity(target)] = target
-            dependencies = graph.call('getDependencies', root, level='class', input=index_key(selector))
-            for target in dependencies['dependencies']:
-                if target['name'] in identifiers:
-                    candidates[index_identity(target)] = target
+        identifiers = referenced_names(unit['source'], language)
+        candidates, function_references = _collect_unit_dependencies(
+            lookup, selector, unit, spans, nodes, language, identifiers,
+        )
 
         if language == 'Python':
             file_candidates, file_ranges, external = collect_python_dependencies(
-                spans, selector['name'], project_files, statements, source, content)
+                spans, selector['name'], project_files, lookup.statements, lookup.source, lookup.content)
         else:
             file_candidates, file_ranges, external = collect_file_dependencies(
                 spans, selector['name'], language, project_files, nodes, identifiers, function_references,
-                source=source, owning_unit=owning_unit, dependency_files=dependency_files,
+                source=lookup.source, owning_unit=lookup.owning_unit, dependency_files=lookup.dependency_files,
             )
         candidates.update(file_candidates)
         dependency_ranges.update(file_ranges)
         result['dependencies']['external'].extend(external)
         for target in candidates.values():
-            node = content(target)['node']
+            node = lookup.content(target)['node']
             if node['kind'] in {'function', 'method', 'constructor'}:
-                target = owning_unit(index_key(target))
+                target = lookup.owning_unit(index_key(target))
             pending.append((target, False))
 
     # 多个入口和依赖可能覆盖同一单元，入口优先，范围按原始坐标去重。
@@ -144,14 +131,58 @@ def extract_source(service, project, functions):
             and span['endLine'] <= entry['endLine'] for entry in entry_ranges.values())],
         key=lambda r: (r['filePath'], r['startLine']))
     result['dependencies']['external'] = list({tuple(row.items()): row for row in result['dependencies']['external']}.values())
-    for file, original in sources.items():
+    for file, original in lookup.sources.items():
         if checked_file(graph, root, file) != original:
             raise ValueError('SOURCE_CHANGED：依赖遍历期间文件变化：' + file)
     check_snapshot(inventory['snapshot'])
     return result
 
 
-def _resolve_entries(functions, nodes, owning_unit):
+def _collect_unit_dependencies(
+    lookup: _SourceLookup,
+    selector: dict,
+    unit: dict,
+    spans: list[dict],
+    nodes: list[dict],
+    language: str,
+    identifiers: set[str],
+) -> tuple[dict[IndexIdentity, dict], set[str]]:
+    """整理成员调用、类型关系以及文件依赖筛选所需的引用名。"""
+    candidates = {}
+    members = [node for node in nodes if any(
+        node['filePath'] == span['filePath'] and span['startLine'] <= node['startLine'] <= span['endLine']
+        for span in spans)]
+    function_references = set()
+    for member in members:
+        body = lookup.content(member)['source']
+        clean_body = code_text(body, language)
+        if language == 'Python':
+            body_start = clean_body.find(':')
+        else:
+            body_start = clean_body.find('{')
+            if body_start < 0:
+                body_start = clean_body.find('=>')
+        # 抽象方法只有声明。声明中的方法名不能充当调用另一实现的证据。
+        if body_start >= 0:
+            function_references.update(referenced_names(clean_body[body_start + 1:], language))
+        response = lookup.graph.callees(lookup.root, member)
+        for field in ('functions', 'decorators', 'instantiates'):
+            for target in response[field]:
+                candidates[index_identity(target)] = target
+    if unit['node']['kind'] in {'class', 'struct', 'interface'}:
+        context = lookup.graph.type_context(lookup.root, selector)
+        for field in ('bases', 'initializers', 'bindings'):
+            for relation in context[field]:
+                target = relation['key']
+                candidates[index_identity(target)] = target
+        dependencies = lookup.graph.call('getDependencies', lookup.root, level='class', input=index_key(selector))
+        for target in dependencies['dependencies']:
+            if target['name'] in identifiers:
+                candidates[index_identity(target)] = target
+    return candidates, function_references
+
+
+def _resolve_entries(functions: list[dict], nodes: list[dict], owning_unit: Callable[[dict], dict]) -> list[dict]:
     """公开输入用三元键定位，索引查询沿用上游的完整定位键。"""
     entries = []
     for function in functions:
@@ -177,11 +208,13 @@ def _python_declaration_start(statements, start):
     return start
 
 
-def referenced_names(source, language):
+def referenced_names(source: str, language: str) -> set[str]:
     return set(re.findall(r'\b[A-Za-z_]\w*\b', code_text(source, language)))
 
 
-def source_ranges(content, source, project_files, language, root):
+def source_ranges(
+    content: dict, source: Callable[[str], str], project_files: list[str], language: str, root: Path,
+) -> list[dict]:
     """普通单元采用SDK坐标，合并源码按原文逐段定位，不能定位时明确失败。"""
     node = content['node']
     span = {'filePath': node['filePath'], 'name': node.get('qualifiedName', node['name']),
@@ -232,7 +265,7 @@ def source_ranges(content, source, project_files, language, root):
     return spans
 
 
-def checked_file(graph, root, file):
+def checked_file(graph: CodeGraph, root: Path, file: str) -> str:
     path = (root / file).resolve(strict=True)
     if not path.is_file() or not path.is_relative_to(root):
         raise ValueError('上游源码文件越界：' + file)

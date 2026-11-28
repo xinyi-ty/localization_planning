@@ -1,17 +1,19 @@
 """先匹配原语言测试，再召回并核验各用例对应的源业务函数。"""
 from collections import Counter
+from collections.abc import Callable
 from functools import cache
 import json
 import logging
 from pathlib import Path, PurePosixPath
 import re
+from typing import TYPE_CHECKING
 
 import torch
 from torch.nn import functional as F
 from transformers import AutoModel, AutoTokenizer
 
 from . import llm
-from .codegraph import index_identity, index_key, symbol_identity, symbol_key
+from .codegraph import CodeGraph, IndexIdentity, index_identity, index_key, symbol_identity, symbol_key
 from .config import load_config
 from .file_context import check_snapshot, code_text
 from .prompts import MAPPING_REVIEW_PROMPT, SOURCE_TEST_REVIEW_PROMPT, build_messages
@@ -19,6 +21,10 @@ from .public_test_analysis import (
     call_evidence, is_test, reference_identity, required_units, test_label, unit_evidence, unit_identity,
 )
 from .public_test_plan import finalize_batches
+
+if TYPE_CHECKING:
+    from .api import Localization
+
 
 logger = logging.getLogger(__name__)
 CHUNK_OVERLAP = 256
@@ -28,7 +34,7 @@ SOURCE_TEST_LIMIT = 3
 class JinaEmbeddings:
     """一个实例加载一次权重，逐块编码以控制8GB显卡上的显存使用。"""
 
-    def __init__(self, model_path, *, settings=None):
+    def __init__(self, model_path: str | Path, *, settings: dict | None = None) -> None:
         settings = settings or {}
         if not {'query_prompt', 'document_prompt', 'max_length'} <= settings.keys():
             settings = {**load_config()['mapping'], **settings}
@@ -45,7 +51,7 @@ class JinaEmbeddings:
         ).to(self.device).eval()
         logger.info('Jina模型已加载 device=%s path=%s', self.device, path)
 
-    def encode(self, texts, *, query):
+    def encode(self, texts: list[str], *, query: bool) -> dict:
         """返回归一化向量及所属输入编号，长代码分块保留全部Token。"""
         prompt = self.query_prompt if query else self.document_prompt
         prefix = self.tokenizer.encode(prompt, add_special_tokens=False)
@@ -76,7 +82,7 @@ class JinaEmbeddings:
         return {'vectors': torch.cat(vectors), 'owners': owners}
 
 
-def test_context(analysis, case, graph):
+def test_context(analysis: dict, case: dict, graph: CodeGraph) -> str:
     """复用共享分析中的调用证据，收集用例与可确认的辅助代码。"""
     units = {unit_identity(unit): unit for unit in analysis['units']}
     selected = required_units(analysis, [case['case']], graph)
@@ -100,7 +106,9 @@ def test_context(analysis, case, graph):
     return '\n\n'.join(sections)
 
 
-def rank_candidates(query_vectors, documents, functions, top_k):
+def rank_candidates(
+    query_vectors: torch.Tensor, documents: dict, functions: list[dict], top_k: int,
+) -> list[dict]:
     """同一代码记录的多个向量按最高余弦相似度归并。"""
     similarities = (query_vectors @ documents['vectors'].T).amax(dim=0)
     scores = {}
@@ -118,7 +126,7 @@ def is_test_file(file):
                 part.lower().endswith('.tests') for part in file.parts[:-1]))
 
 
-def source_tests(inventory, language):
+def source_tests(inventory: dict, language: str) -> list[dict]:
     """从索引识别原语言测试，包括测试文件中带断言的 C++ main。"""
     tests = []
     for record in inventory['functions']:
@@ -184,7 +192,10 @@ def python_instance_members(record, graph, root, records):
             yield candidate, evidence
 
 
-def source_business_calls(test, graph, root, language, records, test_files):
+def source_business_calls(
+    test: dict, graph: CodeGraph, root: Path, language: str,
+    records: dict[IndexIdentity, dict], test_files: set[str],
+) -> tuple[list[dict], list[dict]]:
     """沿原测试及其辅助函数查找业务入口。"""
     pending, seen, functions, evidence = [test], set(), [], []
     while pending:
@@ -238,13 +249,14 @@ def verify_source_tests(case, context, shortlist, results, records, source_langu
     return [shortlist[i - 1] for i in selected]
 
 
-def review_numbers(prompt, payload, count, stage):
+def review_numbers(prompt: str, payload: dict, count: int, stage: str) -> tuple[list[int], dict | None]:
     case = payload['case']
+    messages = build_messages(prompt, payload)
     try:
-        response = llm._call_model(build_messages(prompt, payload))
+        response = llm._call_model(messages)
     except OSError as exc:
-        logger.warning('%s核验调用失败 case=%s：%s', stage, case, exc)
-        return [], None
+        exc.add_note(f'{stage}核验调用失败 case={case}')
+        raise
     try:
         if not isinstance(response, dict) or response.get('finish_reason') != 'stop':
             raise ValueError('模型回复未完整结束')
@@ -259,13 +271,48 @@ def review_numbers(prompt, payload, count, stage):
             raise ValueError('模型须返回候选编号列表或None')
         if len(set(selected)) != len(selected):
             raise ValueError('模型回复包含重复候选编号')
-    except (ValueError, TypeError) as exc:
-        logger.warning('%s核验回复无效 case=%s：%s', stage, case, exc)
-        return [], None
+    except ValueError as exc:
+        raise ValueError(f'{stage}核验回复无效 case={case}：{exc}') from exc
     return selected, response.get('usage')
 
 
-def map_tests(service, project, batches):
+def _map_case(
+    batch_no: int,
+    ref: dict,
+    context: str,
+    shortlist: list[dict],
+    records: dict[IndexIdentity, dict],
+    business_functions: Callable[[IndexIdentity], tuple[list[dict], list[dict]]],
+    source_language: str,
+    target_language: str,
+) -> list[dict]:
+    """按原测试的业务调用候选，确认目标测试实际覆盖的源函数。"""
+    results = [business_functions(index_identity(test)) for test in shortlist]
+    entry_sets = [{index_identity(r['key']) for r in items} for items, _ in results]
+    if not any(entry_sets):
+        logger.warning('原语言测试未定位到候选业务函数 case=%s source_tests=%s', ref, shortlist)
+        return []
+    # 候选测试导向不同业务入口时，再调用模型复核测试匹配结果。
+    matches = shortlist[:1]
+    if any(keys != entry_sets[0] for keys in entry_sets[1:]):
+        matches = verify_source_tests(ref, context, shortlist, results, records,
+                                      source_language, target_language)
+    keys, evidence = set(), []
+    for test in matches:
+        entries, relations = business_functions(index_identity(test))
+        keys.update(index_identity(row['key']) for row in entries)
+        evidence.extend(relations)
+    if not keys:
+        logger.warning('选中的原语言测试没有业务候选 case=%s source_tests=%s', ref, matches)
+        return []
+    candidates = [records[key]['key'] for key in sorted(keys)]
+    logger.info('映射候选 batch=%s case=%s source_tests=%s candidates=%s', batch_no, ref, matches, candidates)
+    return verify_candidates(ref, context, candidates, records, source_language, target_language, evidence)
+
+
+def map_tests(
+    service: "Localization", project: dict, batches: dict[int | str, list[dict]],
+) -> dict[int, list[dict]]:
     """匹配原语言测试，沿调用链召回业务函数，再按目标测试核验。"""
     analysis = service._test_analysis(project)
     batches = finalize_batches(batches, analysis)
@@ -293,40 +340,25 @@ def map_tests(service, project, batches):
     query_indices = {identity: index for index, identity in enumerate(identities)}
 
     @cache
-    def business_functions(key):
+    def business_functions(key: IndexIdentity) -> tuple[list[dict], list[dict]]:
         return source_business_calls(records[key], service.graph, root, service.source, records, test_files)
-
-    def map_case(ref):
-        index = query_indices[reference_identity(ref)]
-        vectors = encoded_queries['vectors'][[i for i, owner in enumerate(encoded_queries['owners']) if owner == index]]
-        shortlist = rank_candidates(vectors, test_documents, originals, top_k=SOURCE_TEST_LIMIT)
-        check_snapshot(analysis['snapshot'])
-        check_snapshot(inventory['snapshot'])
-        results = [business_functions(index_identity(test)) for test in shortlist]
-        entry_sets = [{index_identity(r['key']) for r in items} for items, _ in results]
-        if not any(entry_sets):
-            logger.warning('原语言测试未定位到候选业务函数 case=%s source_tests=%s', ref, shortlist)
-            return []
-        # 候选测试导向不同业务入口时，再调用模型复核测试匹配结果。
-        matches = shortlist[:1]
-        if any(keys != entry_sets[0] for keys in entry_sets[1:]):
-            matches = verify_source_tests(ref, queries[index], shortlist, results, records,
-                                          service.source, service.target)
-        keys, evidence = set(), []
-        for test in matches:
-            entries, relations = business_functions(index_identity(test))
-            keys.update(index_identity(row['key']) for row in entries)
-            evidence.extend(relations)
-        if not keys:
-            logger.warning('选中的原语言测试没有业务候选 case=%s source_tests=%s', ref, matches)
-            return []
-        candidates = [records[key]['key'] for key in sorted(keys)]
-        logger.info('映射候选 batch=%s case=%s source_tests=%s candidates=%s', batch_no, ref, matches, candidates)
-        return verify_candidates(ref, queries[index], candidates, records, service.source, service.target, evidence)
 
     mapped = {}
     for batch_no, batch_refs in batches.items():
-        selected = {index_identity(key): key for ref in batch_refs for key in map_case(ref)}
+        selected = {}
+        for ref in batch_refs:
+            index = query_indices[reference_identity(ref)]
+            vectors = encoded_queries['vectors'][
+                [i for i, owner in enumerate(encoded_queries['owners']) if owner == index]
+            ]
+            shortlist = rank_candidates(vectors, test_documents, originals, top_k=SOURCE_TEST_LIMIT)
+            check_snapshot(analysis['snapshot'])
+            check_snapshot(inventory['snapshot'])
+            matches = _map_case(
+                batch_no, ref, queries[index], shortlist, records, business_functions,
+                service.source, service.target,
+            )
+            selected.update((index_identity(key), key) for key in matches)
         for key in selected.values():
             if public_counts[symbol_identity(key)] > 1:
                 raise ValueError(f'业务入口的三元定位键无法区分同名节点：{symbol_key(key)}')

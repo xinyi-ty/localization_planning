@@ -1,6 +1,7 @@
 """通过 LLM 组装累计公测文件，统一校验发布。"""
 import base64
 from collections import Counter
+from collections.abc import Iterator
 from copy import deepcopy
 import logging
 import os
@@ -9,7 +10,7 @@ from pathlib import Path
 import tempfile
 
 from . import llm
-from .codegraph import GraphError
+from .codegraph import CodeGraph, GraphError, request_scope
 from .file_context import SourceText, check_snapshot, snapshot_roots, prompt_files, python_statements
 from .prompts import RANGE_ASSEMBLY_PROMPT, build_messages
 from .public_test_analysis import (analyze_tests, reference_identity, unit_identity, unit_reference,
@@ -32,7 +33,10 @@ def source_items(text, language):
     return items
 
 
-def prepare_round(batches, batch_no, previous_files, analysis, graph):
+def prepare_round(
+    batches: dict[int, list[dict]], batch_no: int, previous_files: dict[str, str],
+    analysis: dict, graph: CodeGraph,
+) -> dict:
     """准备累计用例、原文和验收规则。"""
     cases = [ref for index, refs in batches.items() if index <= batch_no for ref in refs]
     paths = [name for name, record in analysis['files'].items() if 'source' in record]
@@ -54,7 +58,7 @@ def prepare_round(batches, batch_no, previous_files, analysis, graph):
     }
 
 
-def render_ranges(selection, analysis):
+def render_ranges(selection: dict, analysis: dict) -> dict[str, str]:
     """按原始行号复制片段，Python 单行导入可按原绑定裁剪。"""
     originals = {name: row['source'] for name, row in analysis['files'].items() if 'source' in row}
     if not isinstance(selection, dict) or not selection or not selection.keys() <= originals.keys():
@@ -96,22 +100,6 @@ def render_ranges(selection, analysis):
     return files
 
 
-def llm_assemble(stage, analysis, *, validation_error=None):
-    """读取模型输出，范围路径按原文生成文件。"""
-    payload = {**stage['context'], 'constraints': stage['constraints']}
-    if validation_error is not None:
-        payload['validation_error'] = validation_error
-    check_snapshot(analysis['snapshot'])
-    try:
-        response = llm._call_model(build_messages(RANGE_ASSEMBLY_PROMPT, payload))
-        files = render_ranges(llm.json_response(response), analysis)
-    except (ValueError, TypeError, OSError) as exc:
-        logger.error('LLM组装失败：%s', exc)
-        raise
-    logger.info('LLM组装完成，用量：%s', response.get('usage'))
-    return files
-
-
 def _python_references(text, name):
     """保留原有导入仍被引用的校验。"""
     table = symtable.symtable(text, name, 'exec')
@@ -132,7 +120,9 @@ def _future_imports(text):
             if [token.string for token in statement[:3]] == ['from', '__future__', 'import']]
 
 
-def _validate_files(files, constraints, analysis, graph):
+def _validate_files(
+    files: dict[str, str], constraints: dict, analysis: dict, graph: CodeGraph,
+) -> None:
     """通过隔离的上游索引检查用例，按原文核对已识别的定义。"""
     originals = {name: row for name, row in analysis['files'].items() if 'source' in row}
     if not isinstance(files, dict) or not files or not files.keys() <= originals.keys():
@@ -192,14 +182,32 @@ def _validate_files(files, constraints, analysis, graph):
     check_snapshot(analysis['snapshot'])
 
 
-def validate_and_write(stage, candidate_files, analysis, graph, round_dir):
-    """验收本轮文件并写入暂存目录。"""
+def _assemble_round(stage: dict, analysis: dict, graph: CodeGraph, number: int) -> dict[str, str]:
+    """向模型请求源码范围，仅对候选校验失败发起一次修正。"""
     constraints = stage['constraints']
-    try:
-        _validate_files(candidate_files, constraints, analysis, graph)
-    except (ValueError, GraphError, SyntaxError) as exc:
-        logger.error('组装校验失败：%s', exc)
-        raise
+    payload = {**stage['context'], 'constraints': constraints}
+    for attempt in (1, 2):
+        check_snapshot(analysis['snapshot'])
+        response = llm._call_model(build_messages(RANGE_ASSEMBLY_PROMPT, payload))
+        try:
+            files = render_ranges(llm.json_response(response), analysis)
+            logger.info('LLM组装完成，用量：%s', response.get('usage'))
+            _validate_files(files, constraints, analysis, graph)
+        except (ValueError, SyntaxError) as exc:
+            if attempt == 2:
+                raise
+            check_snapshot(analysis['snapshot'])
+            logger.warning('第%s轮原文范围组装未通过校验，交给模型修正一次：%s', number, exc)
+            payload['validation_error'] = str(exc)
+        else:
+            break
+    return files
+
+
+def _write_round(
+    candidate_files: dict[str, str], constraints: dict, analysis: dict, round_dir: Path,
+) -> list[str]:
+    """写入已通过校验的文件及原始公测资源。"""
     target = Path(round_dir)
     target.mkdir(parents=True, exist_ok=True)
     for name, text in candidate_files.items():
@@ -215,41 +223,80 @@ def validate_and_write(stage, candidate_files, analysis, graph, round_dir):
     return [str(target / name) for name in names]
 
 
-def assemble_tests(batches, analysis, graph, *, output_dir=None):
-    """按模型所选原文范围逐轮组装，统一发布通过校验的文件。"""
-    check_snapshot(analysis['snapshot'])
-    batches = finalize_batches(batches, analysis, require_all=True)
-    language = analysis['language']
-    output = Path(output_dir) if output_dir is not None else Path(tempfile.gettempdir()) / ('localization-rounds-' + os.urandom(8).hex())
+def _assembly_output(output: Path, analysis: dict) -> Path:
+    """统一校验独立组装与逐批组装的输出目录。"""
     if not output.is_absolute():
         raise ValueError('输出目录须为绝对路径')
+    if output.is_symlink():
+        raise FileExistsError('不覆盖已有输出目录：' + str(output))
     output = output.resolve()
     roots = snapshot_roots(analysis['snapshot'])
     if any(output.is_relative_to(p) or p.is_relative_to(output) for p in roots):
         raise ValueError('输出目录不能覆盖或位于原测试目录内')
-    if output.exists() or output.is_symlink():
+    if output.exists():
         raise FileExistsError('不覆盖已有输出目录：' + str(output))
     output.parent.mkdir(parents=True, exist_ok=True)
-    result, previous = {}, {}
-    # 完成轮次尝试后，统一发布通过校验的文件。
+    return output
+
+
+@request_scope
+def _write_checked_round(
+    batches: dict[int, list[dict]], index: int, previous: dict[str, str],
+    analysis: dict, graph: CodeGraph, target: Path,
+) -> list[str]:
+    """单轮查询、组装、校验和写入。"""
+    stage = prepare_round(batches, index, previous, analysis, graph)
+    candidate = _assemble_round(stage, analysis, graph, index)
+    return _write_round(candidate, stage['constraints'], analysis, target)
+
+
+def iter_assembled_tests(
+    batches: dict[int | str, list[dict]], analysis: dict, graph: CodeGraph,
+    *, output_dir: Path,
+) -> Iterator[tuple[int, list[str]]]:
+    """只在调用方请求下一轮时生成下一套累计公测。"""
+    check_snapshot(analysis['snapshot'])
+    batches = finalize_batches(batches, analysis, require_all=True)
+    output = _assembly_output(output_dir, analysis)
+    output.mkdir()
+    previous: dict[str, str] = {}
+    for index in batches:
+        round_dir = output / f'round_{index:03d}'
+        try:
+            with tempfile.TemporaryDirectory(prefix='.assemble-', dir=output) as temporary:
+                staging = Path(temporary) / 'round'
+                target = staging / 'target_project'
+                paths = _write_checked_round(batches, index, previous, analysis, graph, target)
+                previous = {
+                    path.relative_to(target).as_posix():
+                        SourceText(path.read_bytes(), analysis['language'] == 'Python').text
+                    for path in target.rglob('*') if path.is_file()
+                    and 'source' in analysis['files'].get(path.relative_to(target).as_posix(), {})
+                }
+                check_snapshot(analysis['snapshot'])
+                staging.rename(round_dir)
+        except (ValueError, SyntaxError, GraphError, OSError) as exc:
+            logger.error('第%s轮组装失败：%s', index, exc)
+            exc.add_note(f'第 {index} 轮累计公测组装失败')
+            raise
+        yield index, [str(round_dir / Path(path).relative_to(staging)) for path in paths]
+
+
+def assemble_tests(
+    batches: dict[int | str, list[dict]], analysis: dict, graph: CodeGraph,
+    *, output_dir: str | Path | None = None,
+) -> dict[int, list[str]]:
+    """独立组装接口在全部轮次验收后统一发布。"""
+    output = (
+        Path(output_dir) if output_dir is not None
+        else Path(tempfile.gettempdir()) / ('localization-rounds-' + os.urandom(8).hex())
+    )
+    output = _assembly_output(output, analysis)
     with tempfile.TemporaryDirectory(prefix='.assemble-', dir=output.parent) as temporary:
         staging = Path(temporary) / 'result'
-        staging.mkdir()
-        for index in batches:
-            target = staging / f'round_{index:03d}' / 'target_project'
-            stage = prepare_round(batches, index, previous, analysis, graph)
-            try:
-                candidate = llm_assemble(stage, analysis)
-                paths = validate_and_write(stage, candidate, analysis, graph, target)
-            except (ValueError, SyntaxError) as exc:
-                check_snapshot(analysis['snapshot'])
-                logger.warning('第%s轮原文范围组装未通过校验，交给模型修正一次：%s', index, exc)
-                candidate = llm_assemble(stage, analysis, validation_error=str(exc))
-                paths = validate_and_write(stage, candidate, analysis, graph, target)
-            # 下一轮读取实际验收并写入的文件。
-            previous = {p.relative_to(target).as_posix(): SourceText(p.read_bytes(), language == 'Python').text
-                        for p in target.rglob('*') if p.is_file() and 'source' in analysis['files'].get(p.relative_to(target).as_posix(), {})}
-            result[index] = [str(output / Path(path).relative_to(staging)) for path in paths]
-        check_snapshot(analysis['snapshot'])
-        os.rename(staging, output)
-    return result
+        rounds = dict(iter_assembled_tests(batches, analysis, graph, output_dir=staging))
+        staging.rename(output)
+    return {
+        number: [str(output / Path(path).relative_to(staging)) for path in paths]
+        for number, paths in rounds.items()
+    }

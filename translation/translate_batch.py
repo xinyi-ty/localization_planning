@@ -1,7 +1,7 @@
 """读取本批原文、请求翻译并写入通过校验的业务源码。"""
 
 import json
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError
 
 from localization.codegraph import symbol_identity, symbol_key
@@ -9,6 +9,7 @@ from localization.file_context import SourceText
 from localization.llm import _call_model, json_response
 
 from .system_prompt import build_translation_messages
+from .target_project import PublishedTranslation
 
 
 # 输出范围与对应的测试构建配置一致。Python 模块可以位于根目录或包目录。
@@ -22,7 +23,7 @@ SOURCE_LAYOUTS = {
 }
 
 
-def source_blocks(source_root, ranges, language):
+def source_blocks(source_root: Path, ranges: dict, language: str) -> list[dict]:
     """按文件、行号带出入口与项目内依赖原文，合并重叠片段。"""
     intervals = {}
     for row in [*ranges["entry_units"], *ranges["dependencies"]["project"]]:
@@ -52,17 +53,19 @@ def source_blocks(source_root, ranges, language):
     return blocks
 
 
-def test_texts(project, test_paths, language, case_paths):
+def test_texts(
+    project: Path, test_paths: list[Path], language: str, case_paths: set[str],
+) -> dict[str, str]:
     """收集组装文本。资源已复制到工程，能解码的辅助文本也交给模型。"""
+    source_extensions = {
+        extension for layout in SOURCE_LAYOUTS.values() for suffixes in layout.values()
+        for extension in suffixes
+    }
     texts = {}
     for path in test_paths:
         name = path.relative_to(project).as_posix()
         raw = path.read_bytes()
-        source_file = path.suffix.lower() in {
-            extension for layout in SOURCE_LAYOUTS.values() for suffixes in layout.values()
-            for extension in suffixes
-        }
-        if source_file or name in case_paths:
+        if path.suffix.lower() in source_extensions or name in case_paths:
             texts[name] = SourceText(raw, language == "Python" and path.suffix == ".py").text
         elif b"\0" not in raw:
             try:
@@ -73,7 +76,10 @@ def test_texts(project, test_paths, language, case_paths):
     return texts
 
 
-def validated_files(response, project, language, number, source_paths, entries, target_files, business_files):
+def validated_files(
+    response: dict, project: Path, language: str, number: int,
+    source_paths: set[str], entries: list[dict], target_files: dict[str, str], business_files: set[str],
+) -> tuple[dict[Path, bytes], dict[str, list[str]], list[dict]]:
     """检查完整回复、文件范围及关联，再交给写入阶段。"""
     payload = json_response(response)
     if set(payload) != {"files", "missing", "source_to_target", "implemented"}:
@@ -142,7 +148,15 @@ def validated_files(response, project, language, number, source_paths, entries, 
     return produced, relationships, implemented
 
 
-def translate_batch(batch, project, test_paths, build_files, logs, previous):
+def translate_batch(
+    batch: dict,
+    project: Path,
+    test_paths: list[Path],
+    build_files: dict[str, str],
+    logs: Path,
+    previous: PublishedTranslation,
+    target_dependencies: list[dict],
+) -> dict:
     """按批次独立翻译，只允许续写已向模型提供原文的业务文件。"""
     source_language = batch["source_language"]
     target_language = batch["target_language"]
@@ -151,14 +165,14 @@ def translate_batch(batch, project, test_paths, build_files, logs, previous):
     blocks = source_blocks(batch["source_root"], ranges, source_language)
     source_paths = {block["filePath"] for block in blocks}
     entries = [key for key in batch["source_functions"]
-               if symbol_identity(key) not in previous["implemented"]]
+               if symbol_identity(key) not in previous.implemented]
     reference_entries = [key for key in batch["source_functions"]
-                         if symbol_identity(key) in previous["implemented"]]
+                         if symbol_identity(key) in previous.implemented]
 
-    associations = {name: sorted(paths) for name, paths in previous["source_to_target"].items()
+    associations = {name: sorted(paths) for name, paths in previous.source_to_target.items()
                     if name in source_paths}
     related_paths = {name for paths in associations.values() for name in paths}
-    related_paths.update(symbol["filePath"] for row in previous["target_dependencies"]
+    related_paths.update(symbol["filePath"] for row in target_dependencies
                          for symbol in row["dependencies"])
     target_files = {name: SourceText((project / name).read_bytes(), target_language == "Python").text
                     for name in sorted(related_paths)}
@@ -174,8 +188,8 @@ def translate_batch(batch, project, test_paths, build_files, logs, previous):
         "new_cases": batch["new_cases"],
         "public_test_files": test_texts(project, test_paths, target_language, case_paths),
         "target_files": target_files,
-        "target_dependencies": previous["target_dependencies"],
-        "existing_paths": sorted(previous["business_files"]),
+        "target_dependencies": target_dependencies,
+        "existing_paths": sorted(previous.files),
         "source_to_target": associations,
         "production_layout": {path: sorted(suffixes) for path, suffixes in SOURCE_LAYOUTS[target_language].items()},
     }
@@ -184,7 +198,7 @@ def translate_batch(batch, project, test_paths, build_files, logs, previous):
     (logs / "translation_request.json").write_bytes(request)
     try:
         response = _call_model(messages)
-    except Exception as exc:
+    except OSError as exc:
         exc.add_note(f"翻译请求规模 {len(request)} 字节，完整请求见 translation_request.json")
         if isinstance(exc, HTTPError):
             try:
@@ -197,7 +211,7 @@ def translate_batch(batch, project, test_paths, build_files, logs, previous):
 
     files, relationships, implemented = validated_files(
         response, project, target_language, batch["batch"], source_paths, entries,
-        target_files, previous["business_files"],
+        target_files, previous.files,
     )
     for path, raw in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)

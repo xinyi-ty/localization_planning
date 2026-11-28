@@ -1,11 +1,12 @@
 """识别公测用例和源码范围，按需查询辅助代码的调用关系。"""
 import base64
 from collections import defaultdict
+from collections.abc import Iterable
 import os
 from pathlib import Path
 import re
 
-from .codegraph import rebase_key, symbol_identity, symbol_key
+from .codegraph import CodeGraph, SymbolIdentity, rebase_key, symbol_identity, symbol_key
 from .config import SDK_LANGUAGES, public_directories, language as normalize_language
 from .file_context import SourceText, public_bundle, source_snapshot, check_snapshot, snapshot_roots
 
@@ -14,7 +15,7 @@ EXTENSIONS = {'python': ('.py', '.pyi'), 'java': ('.java',), 'csharp': ('.cs',),
               'cpp': ('.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.hh', '.hxx'), 'rust': ('.rs',)}
 
 
-def reference_identity(ref):
+def reference_identity(ref: dict) -> SymbolIdentity:
     if not isinstance(ref, dict) or set(ref) != {'filePath', 'name', 'startLine'}:
         raise ValueError('用例必须包含filePath、name、startLine')
     return symbol_identity(ref)
@@ -121,7 +122,9 @@ def _collect_test_nodes(directories, root, files, language, graph):
     return units, rows
 
 
-def analyze_tests(test_directories, language, graph):
+def analyze_tests(
+    test_directories: str | Path | Iterable[str | Path], language: str, graph: CodeGraph,
+) -> dict:
     """在同一公测快照上识别用例、源码单元和文件内容。"""
     name = normalize_language(language)
     directories = [test_directories] if isinstance(test_directories, (str, Path)) else list(test_directories)
@@ -154,7 +157,7 @@ def analyze_tests(test_directories, language, graph):
     return result
 
 
-def indexed_test_key(graph, project, case):
+def indexed_test_key(graph: CodeGraph, project: Path, case: dict) -> tuple[Path, dict]:
     """从原公测索引恢复公开用例对应的内部定位键。"""
     origin = next((root for root in public_directories(project)
                    if (project / case['filePath']).is_relative_to(root)), None)
@@ -208,7 +211,7 @@ def unit_evidence(analysis, selected):
     return [row for unit in sorted(selected) for row in analysis['call_evidence'].get(unit, ())]
 
 
-def required_units(analysis, cases, graph):
+def required_units(analysis: dict, cases: list[dict], graph: CodeGraph) -> set[tuple[str, int, int]]:
     """按需查询公测调用图，收集可达的必要代码单元。"""
     if 'calls' not in analysis:
         analysis['calls'], analysis['call_evidence'] = _test_calls(analysis, graph)

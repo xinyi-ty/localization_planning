@@ -1,24 +1,15 @@
-"""准备全仓分批和组装结果，按需定位当前批源码。"""
+"""为当前批新增用例映射并提取源码。"""
 
-from localization.config import public_directories
-
-
-def localize_repository(locator, pair, repository_name, original_tests, output):
-    """分批和组装只执行一次，返回每批新增用例和组装文件。"""
-    if output.is_relative_to(original_tests):
-        raise ValueError("组装输出目录须位于原公测工程之外")
-    plan = locator.plan_tests(pair, repository_name)
-    files = locator.assemble_tests(plan, public_directories(original_tests),
-                                   output_dir=output)
-    return {number: {"new_cases": cases, "test_files": files[number]}
-            for number, cases in plan.items()}
+from localization import Localization
 
 
-def localize_batch(locator, repository_name, number, cases):
-    """仅在当前批开始时映射用例并获取源语言入口和依赖。"""
+def localize_batch(
+    locator: Localization, repository_name: str, number: int, cases: list[dict],
+) -> dict | None:
+    """获取当前批的源码范围，正常空映射交由主流程决定如何验收。"""
     functions = locator.map_tests(repository_name, {number: cases})[number]
     if not functions:
-        raise ValueError(f"{repository_name} 第 {number} 批映射未返回源函数")
+        return None
     ranges = locator.extract_source(repository_name, functions)
     if not ranges.get("entry_units"):
         raise ValueError(f"{repository_name} 第 {number} 批源码获取未返回入口范围")

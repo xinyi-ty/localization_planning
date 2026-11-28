@@ -1,14 +1,18 @@
 """从本批候选工程查询新公测依赖的已有目标业务符号。"""
 
 from collections import defaultdict, deque
+from pathlib import Path
 
-from localization.codegraph import index_identity, index_key, request_scope, symbol_identity, symbol_key
+from localization.codegraph import CodeGraph, index_identity, index_key, request_scope, symbol_identity, symbol_key
 from localization.config import SDK_LANGUAGES
 from localization.public_test_analysis import indexed_test_key
 
 
 @request_scope
-def find_target_dependencies(graph, language, original_tests, project, cases, test_paths, business_files):
+def find_target_dependencies(
+    graph: CodeGraph, language: str, original_tests: Path, project: Path,
+    cases: list[dict], test_paths: list[Path], business_files: set[str],
+) -> list[dict]:
     """以组装后的实际位置查询，对外仍使用原始公测的三元键。"""
     graph.prepare(project, SDK_LANGUAGES[language])
     test_files = {path.relative_to(project).as_posix() for path in test_paths}

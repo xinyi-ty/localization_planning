@@ -7,7 +7,11 @@ from copy import deepcopy
 from pathlib import Path, PurePosixPath
 
 
-def symbol_key(value):
+SymbolIdentity = tuple[str, str, int]
+IndexIdentity = tuple[str, str, int, str]
+
+
+def symbol_key(value: dict) -> dict:
     """从上游节点或映射候选提取三元key，附加分数和节点元数据留在原记录中。"""
     if not isinstance(value, dict) or not {'name', 'filePath', 'startLine'} <= value.keys():
         raise ValueError('符号引用必须包含name、filePath、startLine')
@@ -22,12 +26,12 @@ def symbol_key(value):
     return {'name': name, 'filePath': file, 'startLine': line}
 
 
-def symbol_identity(value):
+def symbol_identity(value: dict) -> SymbolIdentity:
     key = symbol_key(value)
     return key['filePath'], key['name'], key['startLine']
 
 
-def index_key(value):
+def index_key(value: dict) -> dict:
     """保留上游对同一索引中的冲突符号提供的定位信息。"""
     key = symbol_key(value)
     if 'symbolId' in value:
@@ -38,7 +42,7 @@ def index_key(value):
     return key
 
 
-def index_identity(value):
+def index_identity(value: dict) -> IndexIdentity:
     key = index_key(value)
     return key['filePath'], key['name'], key['startLine'], key.get('symbolId', '')
 

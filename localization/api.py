@@ -1,9 +1,10 @@
 """对外提供分批、组装、测试映射和源码获取。"""
+from collections.abc import Iterable, Iterator
 from copy import deepcopy
 import logging
 from pathlib import Path
 
-from .assembly import assemble_tests
+from .assembly import assemble_tests, iter_assembled_tests
 from .codegraph import CodeGraph, GraphError, request_scope, symbol_key, symbol_identity
 from .config import language, pair_name, repository, public_directories
 from .mapping import map_tests
@@ -16,7 +17,7 @@ from .public_test_plan import plan_tests
 class Localization:
     """绑定翻译对和上游客户端，提供规划、组装、映射与源码提取入口。"""
 
-    def __init__(self, config, *, target_directory="target_project"):
+    def __init__(self, config: dict, *, target_directory: str = "target_project") -> None:
         self.config = deepcopy(config)
         data = self.config["dataset"]
         # 相对数据集路径以进程启动目录为基准。服务器配置使用绝对路径。
@@ -28,7 +29,7 @@ class Localization:
         self._embedding_model = None
         self._current_project = None
 
-    def _project(self, name, *, fresh=False):
+    def _project(self, name: str, *, fresh: bool = False) -> dict:
         if fresh or self._current_project is None or self._current_project['name'] != name:
             repo = repository(self.root, self.pair, name)
             source = (repo / 'source_project').resolve(strict=True)
@@ -39,46 +40,65 @@ class Localization:
                                      'target_root': target, 'analysis': None, 'source_analysis': None}
         return self._current_project
 
-    def _test_analysis(self, project):
+    def _test_analysis(self, project: dict) -> dict:
         """复用同一仓库的公测分析，每次调用都核对文件快照。"""
         if project['analysis'] is None:
             project['analysis'] = analyze_tests(public_directories(project['target_root']), self.target, self.graph)
         check_snapshot(project['analysis']['snapshot'])
         return project['analysis']
 
-    def _source_analysis(self, project):
+    def _source_analysis(self, project: dict) -> dict:
         if project['source_analysis'] is None:
             project['source_analysis'] = analyze_source(project['source_root'], self.source, self.graph)
         check_snapshot(project['source_analysis']['snapshot'])
         return project['source_analysis']
 
     @request_scope
-    def map_tests(self, repository_name, batches):
+    def map_tests(
+        self, repository_name: str, batches: dict[int | str, list[dict]],
+    ) -> dict[int, list[dict]]:
         """返回各批次经LLM核验并去重的源函数三元key。"""
         return map_tests(self, self._project(repository_name), batches)
 
     @request_scope
-    def plan_tests(self, translation_pair, repository_name):
+    def plan_tests(
+        self, translation_pair: str, repository_name: str,
+    ) -> dict[int, list[dict]]:
         """分批接口，返回批次编号到本批新增用例列表的映射。"""
         if pair_name(translation_pair) != self.pair:
             raise ValueError('请求翻译对与实例绑定的翻译对不一致')
         return plan_tests(self._test_analysis(self._project(repository_name, fresh=True)))
 
     @request_scope
-    def assemble_tests(self, batches, test_directories, *, output_dir=None):
+    def assemble_tests(
+        self, batches: dict[int | str, list[dict]],
+        test_directories: str | Path | Iterable[str | Path],
+        *, output_dir: str | Path | None = None,
+    ) -> dict[int, list[str]]:
         """根据分批结果返回各轮累计测试文件的路径。"""
+        analysis = self._assembly_analysis(test_directories)
+        return assemble_tests(batches, analysis, self.graph, output_dir=output_dir)
+
+    @request_scope
+    def iter_assembled_tests(
+        self, batches: dict[int | str, list[dict]],
+        test_directories: str | Path | Iterable[str | Path], *, output_dir: Path,
+    ) -> Iterator[tuple[int, list[str]]]:
+        """按需生成一轮累计公测，供仓库翻译主流程使用。"""
+        analysis = self._assembly_analysis(test_directories)
+        return iter_assembled_tests(batches, analysis, self.graph, output_dir=output_dir)
+
+    def _assembly_analysis(self, test_directories: str | Path | Iterable[str | Path]) -> dict:
         directories = [test_directories] if isinstance(test_directories, (str, Path)) else list(test_directories)
         directories = sorted({Path(p).resolve(strict=True) for p in directories})
         project = self._current_project
         if project is not None and directories == sorted(public_directories(project['target_root'])):
-            analysis = self._test_analysis(project)
-        else:
-            analysis = analyze_tests(directories, self.target, self.graph)
-        return assemble_tests(batches, analysis, self.graph, output_dir=output_dir)
+            return self._test_analysis(project)
+        return analyze_tests(directories, self.target, self.graph)
 
 
     @request_scope
-    def extract_source(self, repository_name, functions):
+    def extract_source(self, repository_name: str, functions: list[dict]) -> dict:
         """源码获取接口，返回入口源码范围和项目内外依赖。预期提取失败时记录原因并返回空字典。"""
         try:
             if not isinstance(functions, list) or not functions:

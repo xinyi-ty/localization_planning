@@ -1,49 +1,22 @@
-"""生成目标工程的构建配置，并在 Docker 中验证累计公测。"""
+"""执行 Docker 公测，核对报告中的用例和实例状态。"""
 
-import json
+from collections.abc import Iterator
 from pathlib import Path
 import re
 import shlex
 import subprocess
 import xml.etree.ElementTree as ET
 
-from localization.codegraph import request_scope
+from localization.codegraph import CodeGraph, request_scope
 from localization.public_test_analysis import indexed_test_key
 
-from .system_prompt import BUILD_CONFIGS, PYTHON_TEST_REQUIREMENTS
+from .build_config import rust_modules
 
-
-def rust_modules(cases):
-    """用稳定的模块名把 Cargo 的报告标识对应回原测试文件。"""
-    return {name: f"batch_{index}"
-            for index, name in enumerate(sorted({case["filePath"] for case in cases}))}
-
-
-def prepare_target_test_config(language, cases, project, config):
-    """用项目模板或显式给定的仓库配置生成构建文件，返回实际写入的原文。"""
-    filename, source = BUILD_CONFIGS[language]
-    configured = config.get("test_config_path")
-    if configured is not None:
-        source = Path(configured).expanduser().read_bytes().decode("utf-8")
-    files = {filename: source}
-    if language == "Python":
-        files["requirements.txt"] = PYTHON_TEST_REQUIREMENTS
-    elif language == "Rust":
-        # 集成测试入口以相对原路径引用各组装文件，文件内的资源路径仍可使用。
-        files["tests/public_batch.rs"] = "".join(
-            f"#[path = {json.dumps(Path(name).relative_to('tests').as_posix())}]\nmod {module};\n"
-            for name, module in rust_modules(cases).items()
-        )
-    for name, source in files.items():
-        destination = project / name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("xb") as stream:
-            stream.write(source.encode("utf-8"))
-    return files
+TestIdentity = tuple[str, str]
 
 
 @request_scope
-def expected_tests(language, cases, original_tests, graph):
+def expected_tests(language: str, cases: list[dict], original_tests: Path, graph: CodeGraph) -> set[TestIdentity]:
     """使用原文件行号读取测试标识，报告按框架的展示规则比对。"""
     modules = rust_modules(cases) if language == "Rust" else {}
     expected = set()
@@ -79,12 +52,12 @@ def expected_tests(language, cases, original_tests, graph):
     return expected
 
 
-def normalized_name(name):
+def normalized_name(name: str) -> str:
     """去掉报告中的参数文本或参数实例编号。"""
     return re.split(r"[\[(]", name, maxsplit=1)[0].strip()
 
 
-def xml_results(language, reports, project):
+def xml_results(language: str, reports: list[Path], project: Path) -> Iterator[tuple[TestIdentity, bool]]:
     """保留报告中每个实例的状态，确保跳过、失败和额外用例都可见。"""
     for report in reports:
         root = ET.parse(report).getroot()
@@ -117,7 +90,14 @@ def xml_results(language, reports, project):
             yield key, passed
 
 
-def run_target_tests(language, cases, original_tests, project, logs, graph):
+def run_target_tests(
+    language: str,
+    cases: list[dict],
+    original_tests: Path,
+    project: Path,
+    logs: Path,
+    graph: CodeGraph,
+) -> dict:
     """在统一镜像运行本批累计公测，并按原用例身份核对报告。"""
     expected = expected_tests(language, cases, original_tests, graph)
     script = Path(__file__).resolve().parents[1] / "docker" / "run_tests.sh"
